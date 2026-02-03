@@ -1,269 +1,546 @@
-﻿using SeegaGame.Models;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Caching.Memory;
+using SeegaGame.Models;
+using SeegaGame.Services;
 
 namespace SeegaGame.Services
 {
-    public class AiService : IAiService
+    public class AiService
     {
-        private readonly IGameService _gameService;
-        private readonly ILogger<AiService> _logger;
+        private readonly GameService _gs;
+        private readonly IMemoryCache _cache;
+        private static readonly long[,,] Zobrist;
+        private static readonly long SideHash;
 
-        private const double SCORE_WIN = 100000.0;
-        private const double SCORE_MATERIAL = 1000.0;
-        private const double SCORE_CENTER = 60.0;
+        // 評分常數
+        private const double WIN = 1000000.0;
+        private const double MAT = 2000.0;
+        private const double STUCK_ADVANTAGE = 2500.0;
+        private const double CEN = 60.0;
+        private const double FIRST_MOVE_BONUS = 6000.0;
+        private const double SUFFOCATE_BONUS = 3000.0;
+        private const double MOBILITY_LIGHT = 8.0;  // 輕量化機動性權重
 
-        // 平衡調整：威脅扣分回調，避免 AI 為了進攻而無視被吃
-        private const double SCORE_THREAT = -150.0;
-
-        private const double SCORE_MOBILITY = 30.0;
-        private const double SCORE_PRESSURE = 20.0;
-
-        public AiService(IGameService gameService, ILogger<AiService> logger)
+        static AiService()
         {
-            _gameService = gameService;
-            _logger = logger;
+            var rand = new Random(1688);
+            Zobrist = new long[5, 5, 2];
+            for (int r = 0; r < 5; r++)
+                for (int c = 0; c < 5; c++)
+                {
+                    Zobrist[r, c, 0] = RL(rand);
+                    Zobrist[r, c, 1] = RL(rand);
+                }
+            SideHash = RL(rand);
         }
 
-        public Move? GetBestMove(string?[][] board, string aiPlayer, GamePhase phase, int difficulty, Move? lastMoveX, Move? lastMoveO)
+        private static long RL(Random r)
         {
-            // 1. 受困模式：AI 計算拆哪一顆最有利
-            if (phase == GamePhase.STUCK_REMOVAL)
-            {
-                var removeMoves = _gameService.GetValidMoves(board, aiPlayer, GamePhase.STUCK_REMOVAL, null, null);
-                if (!removeMoves.Any()) return null;
+            byte[] b = new byte[8];
+            r.NextBytes(b);
+            return BitConverter.ToInt64(b, 0);
+        }
 
-                // 拆子策略：優先拆掉能讓我下一步吃子的棋子
-                return removeMoves
-                    .OrderByDescending(m => EvaluateRemoval(board, m, aiPlayer, lastMoveX, lastMoveO))
-                    .First();
+        public AiService(GameService gs, IMemoryCache cache)
+        {
+            _gs = gs;
+            _cache = cache;
+        }
+
+        private Dictionary<long, TTEntry> GetTT(string uuid) =>
+            _cache.GetOrCreate(uuid, e =>
+            {
+                e.SlidingExpiration = TimeSpan.FromMinutes(30);
+                return new Dictionary<long, TTEntry>();
+            })!;
+
+        public Move? GetBestMove(AiMoveRequest req)
+        {
+            req.LastMoveX = ValidateLastMove(req.Board, req.LastMoveX, "X");
+            req.LastMoveO = ValidateLastMove(req.Board, req.LastMoveO, "O");
+
+            var tt = GetTT(req.GameUUId);
+            long h = InitialHash(req.Board, req.CurrentPlayer);
+
+            if (req.Phase == GamePhase.STUCK_REMOVAL)
+            {
+                return _gs.GetValidMoves(req.Board, req.CurrentPlayer, req.Phase, null, null)
+                    .OrderByDescending(m => EvaluateRemovalMove(req.Board, m, req.CurrentPlayer, req.LastMoveX, req.LastMoveO))
+                    .FirstOrDefault();
             }
 
-            // 2. 正常模式
-            var moves = _gameService.GetValidMoves(board, aiPlayer, phase, lastMoveX, lastMoveO);
+            int d = CalculateSearchDepth(req.Phase, req.MoveIndex, req.Difficulty);
+            return RootSearch(tt, req, h, d);
+        }
+
+        private Move? ValidateLastMove(string?[][] board, Move? lastMove, string player)
+        {
+            if (lastMove?.To == null) return null;
+            if (lastMove.To.R < 0 || lastMove.To.R >= 5 || lastMove.To.C < 0 || lastMove.To.C >= 5)
+                return null;
+            if (board[lastMove.To.R][lastMove.To.C] != player)
+                return null;
+            if (lastMove.From != null)
+            {
+                if (lastMove.From.R < 0 || lastMove.From.R >= 5 ||
+                    lastMove.From.C < 0 || lastMove.From.C >= 5)
+                    return null;
+            }
+            return lastMove;
+        }
+
+        private int CalculateSearchDepth(GamePhase phase, int moveIndex, int difficulty)
+        {
+            if (phase == GamePhase.PLACEMENT)
+            {
+                return (moveIndex >= 18) ? Math.Min(7, (24 - moveIndex) + 2) : 3;
+            }
+            return difficulty;
+        }
+
+        private string InferFirstPlayer(string currentPlayer, int moveIndex)
+        {
+            if (moveIndex <= 0) return "X";
+            bool isFirstPlayerMove = (moveIndex <= 4) ? (moveIndex <= 2) : (moveIndex % 2 == 1);
+            return isFirstPlayerMove ? currentPlayer : _gs.GetOpponent(currentPlayer);
+        }
+
+        private string GetNextPlayer(string currentPlayer, int moveIndex, GamePhase phase)
+        {
+            if (phase != GamePhase.PLACEMENT)
+                return _gs.GetOpponent(currentPlayer);
+
+            if (moveIndex == 1 || moveIndex == 3)
+                return currentPlayer;
+            else if (moveIndex == 2 || moveIndex == 4)
+                return _gs.GetOpponent(currentPlayer);
+
+            return _gs.GetOpponent(currentPlayer);
+        }
+
+        private bool IsAttacker(string player, string currentPlayer, int moveIndex)
+        {
+            string firstPlayer = InferFirstPlayer(currentPlayer, moveIndex);
+            string secondPlayer = _gs.GetOpponent(firstPlayer);
+            return player == secondPlayer;
+        }
+
+        private bool IsComboMove(int moveIndex, GamePhase phase)
+        {
+            if (phase != GamePhase.PLACEMENT) return false;
+            return (moveIndex == 1 || moveIndex == 3 || moveIndex == 24);
+        }
+
+        // ===== 修正 1: 統一狀態轉換邏輯 =====
+        private (long nextHash, string nextPlayer, GamePhase nextPhase, bool isSamePlayer)
+            GetNextState(long currentHash, Move move, string curr, GamePhase ph, int idx, UndoData ud)
+        {
+            long nh = UpdatePieceHash(currentHash, move, curr, ud.Captured, ud.ClearedCenterPiece);
+            bool isCombo = IsComboMove(idx, ph);
+
+            if (isCombo)
+            {
+                GamePhase nextPhase = (idx == 24) ? GamePhase.MOVEMENT : ph;
+                return (nh, curr, nextPhase, true);
+            }
+            else
+            {
+                return (nh ^ SideHash, _gs.GetOpponent(curr), ph, false);
+            }
+        }
+
+        private Move? RootSearch(Dictionary<long, TTEntry> tt, AiMoveRequest req, long h, int d)
+        {
+            Move? bestM = null;
+            double bestScore = double.NegativeInfinity;
+            double alpha = double.NegativeInfinity;
+
+            var moves = _gs.GetValidMoves(req.Board, req.CurrentPlayer, req.Phase, req.LastMoveX, req.LastMoveO);
             if (!moves.Any()) return null;
 
-            int depth = (phase == GamePhase.PLACEMENT) ? 2 : difficulty;
+            tt.TryGetValue(h, out var entry);
 
-            return ExecuteSearch(board, aiPlayer, phase, depth, moves, lastMoveX, lastMoveO);
-        }
-
-        private double EvaluateRemoval(string?[][] board, Move move, string aiPlayer, Move? lastX, Move? lastO)
-        {
-            var tempBoard = _gameService.CloneBoard(board);
-            tempBoard[move.To.R][move.To.C] = null;
-
-            // 移除後，我的機動性如何？
-            var myMoves = _gameService.GetValidMoves(tempBoard, aiPlayer, GamePhase.MOVEMENT, lastX, lastO);
-            double score = myMoves.Count * 50.0;
-
-            // 移除後，我能否立刻吃子？(連動獎勵)
-            foreach (var m in myMoves)
+            // ===== 修正 2: 增強 Move Ordering =====
+            var ordered = moves.OrderByDescending(m =>
             {
-                var simBoard = _gameService.CloneBoard(tempBoard);
-                if (m.From != null) simBoard[m.From.R][m.From.C] = null;
-                simBoard[m.To.R][m.To.C] = aiPlayer;
-                var (_, captured) = _gameService.ProcessMoveEffect(simBoard, m.To, aiPlayer, GamePhase.MOVEMENT, m.From);
-                if (captured.Count > 0) score += 3000.0; // 發現移除後的連殺機會
-            }
-            return score;
-        }
+                // TT 最佳著法優先
+                if (entry?.BestMove != null && IsSameMove(m, entry.BestMove))
+                    return 1000000;
 
-        private Move? ExecuteSearch(string?[][] board, string aiPlayer, GamePhase phase, int depth, List<Move> moves, Move? lastMoveX, Move? lastMoveO)
-        {
-            Move? bestMove = null;
-            double bestScore = double.NegativeInfinity;
-            string opponent = _gameService.GetOpponent(aiPlayer);
+                // 中心點優先
+                if (m.To.R == 2 && m.To.C == 2)
+                    return 100;
 
-            var orderedMoves = moves
-                .Select(m => new { Move = m, Score = QuickEvaluate(board, m, aiPlayer, phase) })
-                .OrderByDescending(x => x.Score)
-                .ThenBy(x => x.Move.To.R).ThenBy(x => x.Move.To.C)
-                .ToList();
+                // 其他啟發式評估
+                return GetMoveOrderingScore(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex,
+                                           req.LastMoveX, req.LastMoveO);
+            });
 
-            foreach (var item in orderedMoves)
+            foreach (var m in ordered)
             {
-                var nextBoard = SimulateMove(board, item.Move, aiPlayer, phase);
-                Move? nextX = (aiPlayer == "X") ? item.Move : lastMoveX;
-                Move? nextO = (aiPlayer == "O") ? item.Move : lastMoveO;
+                var ud = _gs.MakeMove(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex);
 
-                double score = Minimax(nextBoard, depth - 1, double.NegativeInfinity, double.PositiveInfinity, false, aiPlayer, opponent, nextX, nextO, phase);
+                var state = GetNextState(h, m, req.CurrentPlayer, req.Phase, req.MoveIndex, ud);
+
+                double score;
+                Move? nextX = (req.CurrentPlayer == "X") ? m : req.LastMoveX;
+                Move? nextO = (req.CurrentPlayer == "O") ? m : req.LastMoveO;
+
+                if (state.isSamePlayer)
+                {
+                    score = AlphaBeta(tt, req.Board, state.nextHash, d - 1, alpha, double.PositiveInfinity,
+                                     req.CurrentPlayer, nextX, nextO, state.nextPhase, req.MoveIndex + 1);
+                }
+                else
+                {
+                    score = -AlphaBeta(tt, req.Board, state.nextHash, d - 1, double.NegativeInfinity, -alpha,
+                                      state.nextPlayer, nextX, nextO, state.nextPhase, req.MoveIndex + 1);
+                }
+
+                _gs.UnmakeMove(req.Board, ud, req.CurrentPlayer);
 
                 if (score > bestScore)
                 {
                     bestScore = score;
-                    bestMove = item.Move;
+                    bestM = m;
                 }
+                alpha = Math.Max(alpha, bestScore);
             }
-            return bestMove;
+
+            if (bestM != null && tt.Count < 500000)
+            {
+                tt[h] = new TTEntry
+                {
+                    Depth = d,
+                    Score = bestScore,
+                    Flag = 0,
+                    BestMove = bestM
+                };
+            }
+
+            return bestM;
         }
 
-        private double Minimax(string?[][] board, int depth, double alpha, double beta, bool isMaximizing, string aiPlayer, string opponent, Move? lastMoveX, Move? lastMoveO, GamePhase phase)
+        private double AlphaBeta(Dictionary<long, TTEntry> tt, string?[][] board, long h, int d,
+                                double alpha, double beta, string curr, Move? lX, Move? lO,
+                                GamePhase ph, int idx)
         {
-            string? winner = _gameService.CheckWinner(board, phase);
-            if (winner == aiPlayer) return SCORE_WIN + depth * 1000;
-            if (winner == opponent) return -SCORE_WIN - depth * 1000;
+            double originalAlpha = alpha;
 
-            // 葉節點評估
-            if (depth == 0) return EvaluateBoard(board, aiPlayer, opponent, lastMoveX, lastMoveO);
-
-            var currentPlayer = isMaximizing ? aiPlayer : opponent;
-            var moves = _gameService.GetValidMoves(board, currentPlayer, GamePhase.MOVEMENT, lastMoveX, lastMoveO);
-
-            // 受困價值反轉
-            if (!moves.Any())
+            if (tt.TryGetValue(h, out var entry) && entry.Depth >= d)
             {
-                // 先計算當前盤面分數
-                double currentScore = EvaluateBoard(board, aiPlayer, opponent, lastMoveX, lastMoveO);
+                if (entry.Flag == 0) return entry.Score;
+                if (entry.Flag == 1 && entry.Score <= alpha) return alpha;
+                if (entry.Flag == 2 && entry.Score >= beta) return beta;
+            }
 
-                // 判斷誰受困？
-                if (currentPlayer == aiPlayer)
+            string? winner = _gs.CheckWinner(board, ph);
+            if (winner != null)
+            {
+                return (winner == curr) ? (WIN + d) : (-WIN - d);
+            }
+
+            if (d <= 0)
+            {
+                return Quiesce(tt, board, h, alpha, beta, curr, lX, lO, ph, idx);
+            }
+
+            var moves = _gs.GetValidMoves(board, curr, ph, lX, lO);
+
+            if (moves.Count == 0)
+            {
+                double baseScore = EvaluatePosition(board, curr, ph, idx);
+                return baseScore + STUCK_ADVANTAGE;
+            }
+
+            double bestScore = double.NegativeInfinity;
+            Move? bestMove = null;
+
+            foreach (var m in moves)
+            {
+                var ud = _gs.MakeMove(board, m, curr, ph, idx);
+
+                var state = GetNextState(h, m, curr, ph, idx, ud);
+
+                double score;
+                Move? nextX = (curr == "X") ? m : lX;
+                Move? nextO = (curr == "O") ? m : lO;
+
+                if (state.isSamePlayer)
                 {
-                    // AI (我) 受困 -> 我可以移除對手一顆子
-                    // 效果等同於我吃了一顆子 (+1000)
-                    // 所以這裡要回傳「比當前盤面更好」的分數
-                    return currentScore + SCORE_MATERIAL;
+                    score = AlphaBeta(tt, board, state.nextHash, d - 1, alpha, beta, curr,
+                                     nextX, nextO, state.nextPhase, idx + 1);
                 }
                 else
                 {
-                    // 對手受困 -> 對手可以移除我一顆子
-                    // 效果等同於我被吃了一顆子 (-1000)
-                    // 所以這裡要回傳「比當前盤面更差」的分數
-                    return currentScore - SCORE_MATERIAL;
+                    score = -AlphaBeta(tt, board, state.nextHash, d - 1, -beta, -alpha,
+                                      state.nextPlayer, nextX, nextO, state.nextPhase, idx + 1);
                 }
-            }
 
-            if (isMaximizing)
-            {
-                double maxEval = double.NegativeInfinity;
-                foreach (var move in moves)
+                _gs.UnmakeMove(board, ud, curr);
+
+                if (score > bestScore)
                 {
-                    var nextBoard = SimulateMove(board, move, aiPlayer, GamePhase.MOVEMENT);
-                    Move? nextX = (aiPlayer == "X") ? move : lastMoveX;
-                    Move? nextO = (aiPlayer == "O") ? move : lastMoveO;
-
-                    double eval = Minimax(nextBoard, depth - 1, alpha, beta, false, aiPlayer, opponent, nextX, nextO, GamePhase.MOVEMENT);
-                    maxEval = Math.Max(maxEval, eval);
-                    alpha = Math.Max(alpha, eval);
-                    if (beta <= alpha) break;
+                    bestScore = score;
+                    bestMove = m;
                 }
-                return maxEval;
+
+                alpha = Math.Max(alpha, score);
+                if (alpha >= beta) break;
             }
-            else
+
+            int flag = (bestScore <= originalAlpha) ? 1 : (bestScore >= beta) ? 2 : 0;
+            if (tt.Count < 500000)
             {
-                double minEval = double.PositiveInfinity;
-                foreach (var move in moves)
+                tt[h] = new TTEntry
                 {
-                    var nextBoard = SimulateMove(board, move, opponent, GamePhase.MOVEMENT);
-                    Move? nextX = (opponent == "X") ? move : lastMoveX;
-                    Move? nextO = (opponent == "O") ? move : lastMoveO;
-
-                    double eval = Minimax(nextBoard, depth - 1, alpha, beta, true, aiPlayer, opponent, nextX, nextO, GamePhase.MOVEMENT);
-                    minEval = Math.Min(minEval, eval);
-                    beta = Math.Min(beta, eval);
-                    if (beta <= alpha) break;
-                }
-                return minEval;
+                    Depth = d,
+                    Score = bestScore,
+                    Flag = flag,
+                    BestMove = bestMove
+                };
             }
+
+            return bestScore;
         }
 
-        private double QuickEvaluate(string?[][] board, Move move, string player, GamePhase phase)
+        // ===== 修正 3: Quiesce 使用統一狀態轉換 + 存表 =====
+        private double Quiesce(Dictionary<long, TTEntry> tt, string?[][] board, long h,
+                              double alpha, double beta, string curr,
+                              Move? lX, Move? lO, GamePhase ph, int idx)
         {
-            var nextBoard = SimulateMove(board, move, player, phase);
-            string opponent = _gameService.GetOpponent(player);
+            // 查表
+            if (tt.TryGetValue(h, out var entry) && entry.Depth >= 0)
+            {
+                if (entry.Flag == 0) return entry.Score;
+            }
 
-            // 殺招
-            if (_gameService.CountPlayerPieces(nextBoard, opponent) < 2) return 10000000.0;
+            double standPat = EvaluatePosition(board, curr, ph, idx);
+            if (standPat >= beta) return beta;
+            if (standPat > alpha) alpha = standPat;
 
-            // 吃子
-            int captured = _gameService.CountPlayerPieces(board, opponent) - _gameService.CountPlayerPieces(nextBoard, opponent);
+            var moves = _gs.GetValidMoves(board, curr, ph, lX, lO);
 
-            // 移動中心
-            double centerBonus = 0;
-            if (phase == GamePhase.MOVEMENT && move.To.R == 2 && move.To.C == 2) centerBonus = 200.0;
+            foreach (var m in moves)
+            {
+                var ud = _gs.MakeMove(board, m, curr, ph, idx);
 
-            return (captured * 1000.0) + centerBonus;
+                if (ud.Captured.Count == 0)
+                {
+                    _gs.UnmakeMove(board, ud, curr);
+                    continue;
+                }
+
+                // 使用統一的狀態轉換（解決雜湊一致性問題）
+                var state = GetNextState(h, m, curr, ph, idx, ud);
+
+                Move? nextX = (curr == "X") ? m : lX;
+                Move? nextO = (curr == "O") ? m : lO;
+
+                double score;
+                if (state.isSamePlayer)
+                {
+                    score = Quiesce(tt, board, state.nextHash, alpha, beta, curr,
+                                   nextX, nextO, state.nextPhase, idx + 1);
+                }
+                else
+                {
+                    score = -Quiesce(tt, board, state.nextHash, -beta, -alpha, state.nextPlayer,
+                                    nextX, nextO, state.nextPhase, idx + 1);
+                }
+
+                _gs.UnmakeMove(board, ud, curr);
+
+                if (score >= beta) return beta;
+                if (score > alpha) alpha = score;
+            }
+
+            // 靜態搜尋也存入 TT
+            if (tt.Count < 500000)
+            {
+                tt[h] = new TTEntry { Depth = 0, Score = alpha, Flag = 0 };
+            }
+
+            return alpha;
         }
 
-        private double EvaluateBoard(string?[][] board, string aiPlayer, string opponent, Move? lastX, Move? lastO)
+        // ===== 修正 4: 輕量化評估函數（移除 GetValidMoves） =====
+        private double EvaluatePosition(string?[][] board, string currentPlayer, GamePhase phase, int moveIndex)
         {
             double score = 0;
-            int aiCount = 0;
-            int opCount = 0;
+            int myPieces = 0;
+            int opPieces = 0;
+            int myMobilityLight = 0;  // 輕量化機動性
+            int opMobilityLight = 0;
+            string opponent = _gs.GetOpponent(currentPlayer);
+
+            bool iAmAttacker = IsAttacker(currentPlayer, currentPlayer, moveIndex);
 
             for (int r = 0; r < 5; r++)
             {
                 for (int c = 0; c < 5; c++)
                 {
-                    string? p = board[r][c];
-                    if (p == null) continue;
+                    string? piece = board[r][c];
 
-                    bool isCenter = (r >= 1 && r <= 3 && c >= 1 && c <= 3);
-
-                    if (p == aiPlayer)
+                    if (piece == currentPlayer)
                     {
-                        aiCount++;
-                        if (isCenter) score += SCORE_CENTER;
-                        if (IsNextToEnemy(board, r, c, opponent)) score += SCORE_PRESSURE;
+                        myPieces++;
+                        if (r == 2 && c == 2) score += CEN;
 
-                        // 威脅扣分 (現在是 -150，平衡點)
-                        if (opCount >= 2 && IsThreatened(board, r, c, aiPlayer, opponent))
-                            score += SCORE_THREAT;
+                        if (phase == GamePhase.PLACEMENT)
+                        {
+                            int vulnerability = CalculateVulnerability(board, r, c, opponent);
+                            score -= iAmAttacker ? vulnerability * 100 : vulnerability * 700;
+                        }
+
+                        // 輕量化機動性：計算周圍空格數
+                        if (phase == GamePhase.MOVEMENT)
+                        {
+                            myMobilityLight += CountAdjacentEmpty(board, r, c);
+                        }
                     }
-                    else if (p == opponent)
+                    else if (piece == opponent)
                     {
-                        opCount++;
-                        if (isCenter) score -= SCORE_CENTER;
+                        opPieces++;
+
+                        if (phase == GamePhase.MOVEMENT)
+                        {
+                            opMobilityLight += CountAdjacentEmpty(board, r, c);
+                        }
                     }
                 }
             }
 
-            // 機動性
-            var aiMoves = _gameService.GetValidMoves(board, aiPlayer, GamePhase.MOVEMENT, lastX, lastO);
-            var opMoves = _gameService.GetValidMoves(board, opponent, GamePhase.MOVEMENT, lastX, lastO);
-            score += (aiMoves.Count - opMoves.Count) * SCORE_MOBILITY;
+            // 下一手權評估
+            if (phase == GamePhase.PLACEMENT)
+            {
+                string nextPlayer = GetNextPlayer(currentPlayer, moveIndex, phase);
+                score += (nextPlayer == currentPlayer) ? FIRST_MOVE_BONUS : -FIRST_MOVE_BONUS;
+            }
 
-            // 材力
-            int total = aiCount + opCount;
-            double phaseFactor = 1.0 + Math.Max(0, (24 - total) / 8.0);
-            score += (aiCount - opCount) * SCORE_MATERIAL * phaseFactor;
+            // 輕量化機動性評估（不呼叫 GetValidMoves）
+            if (phase == GamePhase.MOVEMENT)
+            {
+                score += (myMobilityLight - opMobilityLight) * MOBILITY_LIGHT;
+            }
+
+            score += (myPieces - opPieces) * MAT;
 
             return score;
         }
 
-        private string?[][] SimulateMove(string?[][] board, Move move, string player, GamePhase phase)
+        // ===== 輕量化機動性計算 =====
+        private int CountAdjacentEmpty(string?[][] board, int r, int c)
         {
-            var temp = _gameService.CloneBoard(board);
-            if (move.From != null) temp[move.From.R][move.From.C] = null;
-            temp[move.To.R][move.To.C] = player;
-            var (res, _) = _gameService.ProcessMoveEffect(temp, move.To, player, phase, move.From);
-            return res;
-        }
+            int count = 0;
+            int[] dr = { -1, 1, 0, 0 };
+            int[] dc = { 0, 0, -1, 1 };
 
-        private bool IsNextToEnemy(string?[][] board, int r, int c, string enemy)
-        {
-            int[] dr = { -1, 1, 0, 0 }, dc = { 0, 0, -1, 1 };
             for (int i = 0; i < 4; i++)
             {
-                int nr = r + dr[i], nc = c + dc[i];
-                if (nr >= 0 && nr < 5 && nc >= 0 && nc < 5 && board[nr][nc] == enemy) return true;
+                int nr = r + dr[i];
+                int nc = c + dc[i];
+                if (In(nr, nc) && board[nr][nc] == null)
+                    count++;
             }
+
+            return count;
+        }
+
+        private int CalculateVulnerability(string?[][] board, int r, int c, string opponent)
+        {
+            int vulnerability = 0;
+            int[] dr = { -1, 1, 0, 0 };
+            int[] dc = { 0, 0, -1, 1 };
+
+            for (int i = 0; i < 4; i++)
+            {
+                int nearR = r + dr[i];
+                int nearC = c + dc[i];
+                int farR = r - dr[i];
+                int farC = c - dc[i];
+
+                if (!In(nearR, nearC) || !In(farR, farC)) continue;
+
+                if (board[nearR][nearC] == opponent && board[farR][farC] == null)
+                {
+                    vulnerability++;
+                }
+            }
+
+            return vulnerability;
+        }
+
+        private double GetMoveOrderingScore(string?[][] board, Move m, string player,
+                                           GamePhase phase, int moveIndex,
+                                           Move? lastX, Move? lastO)
+        {
+            if (phase != GamePhase.MOVEMENT) return 0;
+
+            var ud = _gs.MakeMove(board, m, player, phase, moveIndex);
+            double score = ud.Captured.Count * 1000;
+
+            Move? nextX = (player == "X") ? m : lastX;
+            Move? nextO = (player == "O") ? m : lastO;
+            var opMoves = _gs.GetValidMoves(board, _gs.GetOpponent(player),
+                                           GamePhase.MOVEMENT, nextX, nextO);
+
+            if (opMoves.Count == 0) score += SUFFOCATE_BONUS;
+
+            _gs.UnmakeMove(board, ud, player);
+            return score;
+        }
+
+        private double EvaluateRemovalMove(string?[][] board, Move m, string player,
+                                          Move? lastX, Move? lastO)
+        {
+            var ud = _gs.MakeMove(board, m, player, GamePhase.STUCK_REMOVAL, 0);
+
+            var myMoves = _gs.GetValidMoves(board, player, GamePhase.MOVEMENT, lastX, lastO);
+            double score = myMoves.Count * 10.0;
+
+            foreach (var nextMove in myMoves)
+            {
+                var ud2 = _gs.MakeMove(board, nextMove, player, GamePhase.MOVEMENT, 1);
+                if (ud2.Captured.Count > 0) score += 5000.0;
+                _gs.UnmakeMove(board, ud2, player);
+            }
+
+            _gs.UnmakeMove(board, ud, player);
+            return score;
+        }
+
+        private bool IsSameMove(Move a, Move b)
+        {
+            if (a.From == null && b.From == null)
+                return a.To.R == b.To.R && a.To.C == b.To.C;
+
+            if (a.From != null && b.From != null)
+                return a.From.R == b.From.R && a.From.C == b.From.C &&
+                       a.To.R == b.To.R && a.To.C == b.To.C;
+
             return false;
         }
 
-        private bool IsThreatened(string?[][] board, int r, int c, string me, string enemy)
+        private bool In(int r, int c) => r >= 0 && r < 5 && c >= 0 && c < 5;
+
+        private long UpdatePieceHash(long h, Move m, string p, List<(Position Pos, string Player)> caps, string? cen)
         {
-            bool top = IsEnemy(board, r - 1, c, enemy);
-            bool bot = IsEnemy(board, r + 1, c, enemy);
-            if (top && bot) return true;
-            bool left = IsEnemy(board, r, c - 1, enemy);
-            bool right = IsEnemy(board, r, c + 1, enemy);
-            if (left && right) return true;
-            return false;
+            int pi = p == "X" ? 0 : 1;
+            if (m.From != null) h ^= Zobrist[m.From.R, m.From.C, pi];
+            h ^= Zobrist[m.To.R, m.To.C, pi];
+            foreach (var cap in caps) h ^= Zobrist[cap.Pos.R, cap.Pos.C, 1 - pi];
+            if (cen != null) h ^= Zobrist[2, 2, cen == "X" ? 0 : 1];
+            return h;
         }
 
-        private bool IsEnemy(string?[][] board, int r, int c, string enemy)
+        private long InitialHash(string?[][] b, string curr)
         {
-            if (r < 0 || r >= 5 || c < 0 || c >= 5) return false;
-            return board[r][c] == enemy;
+            long h = (curr == "X" ? 0 : SideHash);
+            for (int r = 0; r < 5; r++)
+                for (int c = 0; c < 5; c++)
+                    if (b[r][c] != null) h ^= Zobrist[r, c, b[r][c] == "X" ? 0 : 1];
+            return h;
         }
     }
 }
