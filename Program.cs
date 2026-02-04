@@ -30,11 +30,7 @@ builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", policy =>
     {
-        policy.WithOrigins(
-            "http://localhost:5173", // Vue 3 Vite 預設
-            "http://localhost:3000", // React 預設
-            "http://localhost:8080"  // 舊版 Vue CLI
-        )
+        policy.WithOrigins("https://seega.pages.dev/")
         .AllowAnyMethod()
         .AllowAnyHeader();
     });
