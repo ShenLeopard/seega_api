@@ -55,13 +55,13 @@ namespace SeegaGame.Models
         public string? Winner { get; set; } // "X" 或 "O" 或 null
         public bool IsGameOver { get; set; }
     }
-
-    public class TTEntry
+    public struct TTEntry
     {
-        public int Depth { get; set; }
-        public double Score { get; set; }
-        public int Flag { get; set; } // 0:Exact, 1:Upper, 2:Lower
-        public Move? BestMove { get; set; }
+        public long Key;        // 8 bytes
+        public int Score;       // 4 bytes
+        public short BestMove;  // 2 bytes
+        public byte Depth;      // 1 byte
+        public byte Flag;       // 1 byte
     }
 
     // 用於 Undo Move 的紀錄物件
