@@ -30,11 +30,12 @@ builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", policy =>
     {
-        policy.WithOrigins("https://seega.pages.dev/")
-        .AllowAnyMethod()
-        .AllowAnyHeader();
+        policy.WithOrigins("https://seega.pages.dev")
+              .AllowAnyMethod()
+              .AllowAnyHeader();
     });
 });
+
 
 var app = builder.Build();
 
