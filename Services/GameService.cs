@@ -6,63 +6,7 @@ namespace SeegaGame.Services
     {
 
         public string GetOpponent(string p) => p == "O" ? "X" : "O";
-
-        public string?[][] CloneBoard(string?[][] board)
-        {
-            var newBoard = new string?[5][];
-            for (int i = 0; i < 5; i++) newBoard[i] = (string?[])board[i].Clone();
-            return newBoard;
-        }
         private bool In(int r, int c) => r >= 0 && r < 5 && c >= 0 && c < 5;
-        // 處理移動後的效應（主要是計算夾擊吃子）
-        public (string?[][] NewBoard, List<Position> Captured) ProcessMoveEffect(string?[][] board, Position to, string player, GamePhase phase, Position? from)
-        {
-            // 只有「移動階段」才會有吃子發效
-            if (phase != GamePhase.MOVEMENT)
-            {
-                return (board, new List<Position>());
-            }
-
-            var captured = new List<Position>();
-            string opponent = GetOpponent(player);
-
-            // 定義上下左右四個方向
-            int[] dr = { -1, 1, 0, 0 };
-            int[] dc = { 0, 0, -1, 1 };
-
-            for (int i = 0; i < 4; i++)
-            {
-                // r1, c1: 緊鄰的格子 (可能是敵方棋子)
-                int r1 = to.R + dr[i];
-                int c1 = to.C + dc[i];
-
-                // r2, c2: 再往外一格 (必須是我方棋子，形成夾擊)
-                int r2 = to.R + (dr[i] * 2);
-                int c2 = to.C + (dc[i] * 2);
-
-                // 檢查邊界
-                if (IsValidPos(r2, c2))
-                {
-                    // 夾擊判斷公式： [我方(to)] - [敵方(r1,c1)] - [我方(r2,c2)]
-                    if (board[r1][c1] == opponent && board[r2][c2] == player)
-                    {
-                        // 記錄被吃掉的位置
-                        captured.Add(new Position { R = r1, C = c1 });
-
-                        // 從棋盤上移除該棋子
-                        board[r1][c1] = null;
-                    }
-                }
-            }
-
-            return (board, captured);
-        }
-
-        // 輔助：檢查座標是否在棋盤內 (0~4)
-        private bool IsValidPos(int r, int c)
-        {
-            return r >= 0 && r < 5 && c >= 0 && c < 5;
-        }
         // === 核心邏輯：執行動作並回傳 Undo 資料 (給 AI 遞迴用) ===
         public UndoData MakeMove(string?[][] board, Move move, string player, GamePhase phase, int moveIndex)
         {
@@ -181,11 +125,8 @@ namespace SeegaGame.Services
             return moves;
         }
 
-        public string? CheckWinner(string?[][] board, GamePhase phase)
+        public string? CheckWinner(string?[][] board)
         {
-            // 只有移動階段或移除階段才判贏
-            if (phase == GamePhase.PLACEMENT) return null;
-
             int x = 0, o = 0;
             for (int r = 0; r < 5; r++)
                 for (int c = 0; c < 5; c++)
@@ -193,114 +134,114 @@ namespace SeegaGame.Services
                     if (board[r][c] == "X") x++;
                     else if (board[r][c] == "O") o++;
                 }
-
             if (x < 2) return "O";
             if (o < 2) return "X";
             return null;
         }
+        // 將座標 (r:1, c:2) 轉換為人類可讀的 B3 格式
+        public string FormatPos(Position p)
+        {
+            if (p == null) return "??";
 
+            // R: 0->A, 1->B, 2->C, 3->D, 4->E
+            char rowChar = (char)('A' + p.R);
+
+            // C: 0->1, 1->2, 2->3, 3->4, 4->5
+            int colNum = p.C + 1;
+
+            return $"{rowChar}{colNum}";
+        }
         // === 核心邏輯：執行請求並回傳結果 (Controller 用) ===
         public MoveResponse ExecuteMove(string?[][] board, string player, GamePhase phase, Move move, Move? lastMoveX, Move? lastMoveO, int moveIndex)
         {
-            // 1. 物理防呆檢查
+            // 1. 物理防呆
             if (phase != GamePhase.STUCK_REMOVAL && board[move.To.R][move.To.C] != null)
             {
-                return new MoveResponse { Success = false, Message = "該位置已有棋子！" };
+                return new MoveResponse { Success = false, Error = "該位置已有棋子" };
             }
-            if (phase == GamePhase.PLACEMENT && move.To.R == 2 && move.To.C == 2)
+
+            // 2. 執行物理動作 (產生新盤面)
+            string?[][] newBoard = new string?[5][];
+            for (int r = 0; r < 5; r++) newBoard[r] = (string?[])board[r].Clone();
+
+            var ud = MakeMove(newBoard, move, player, phase, moveIndex);
+
+            // 3. 準備基本訊息 (移動位置與吃子數)
+            string toStr = FormatPos(move.To);
+            string actionDesc = (phase == GamePhase.PLACEMENT) ? $"在 {toStr} 佈陣" :
+                                (phase == GamePhase.STUCK_REMOVAL ? $"移除 {toStr} 敵子" :
+                                $"從 {FormatPos(move.From!)} 移動到 {toStr}");
+
+            string baseMsg = $"玩家 {player} {actionDesc}";
+            if (ud.Captured.Count > 0) baseMsg += $"，吃掉 {ud.Captured.Count} 子";
+
+            // ============================================================
+            // ★ 核心修正點 1：勝負判定擁有「絕對優先權」
+            // ============================================================
+            string? winner = CheckWinner(newBoard);
+            if (winner != null)
             {
-                return new MoveResponse { Success = false, Message = "佈陣階段不可佔領中心點！" };
+                // 只要有人贏了，立刻回傳，後面的受困邏輯「絕對」不會跑
+                return new MoveResponse
+                {
+                    Success = true,
+                    NewBoard = newBoard,
+                    NextPlayer = string.Empty,
+                    NextPhase = GamePhase.GAME_OVER, // 進入結束階段
+                    Move = move,
+                    MoveIndex = moveIndex + 1, // 步數正確遞增
+                    CapturedPieces = ud.Captured.Select(c => c.Pos).ToList(),
+                    CapturedCount = ud.Captured.Count,
+                    Winner = winner,
+                    IsGameOver = true,
+                    Message = baseMsg + $"。🎉 遊戲結束！獲勝者：{winner}"
+                };
             }
 
-            // 2. 執行物理動作
-            var tempBoard = CloneBoard(board);
-            string actionDesc = "";
-            List<Position> captured = new List<Position>();
-            GamePhase nextPhase = phase;
-
-            if (phase == GamePhase.STUCK_REMOVAL)
-            {
-                tempBoard[move.To.R][move.To.C] = null;
-                actionDesc = $"移除 ({move.To.R},{move.To.C})";
-                nextPhase = GamePhase.MOVEMENT;
-            }
-            else
-            {
-                if (move.From != null) tempBoard[move.From.R][move.From.C] = null;
-                tempBoard[move.To.R][move.To.C] = player;
-
-                var effect = ProcessMoveEffect(tempBoard, move.To, player, phase, move.From);
-                tempBoard = effect.NewBoard;
-                captured = effect.Captured;
-
-                if (move.From == null) actionDesc = $"佈陣於 ({move.To.R},{move.To.C})";
-                else actionDesc = $"移動 ({move.From.R},{move.From.C}) → ({move.To.R},{move.To.C})";
-            }
-
-            // 3. 決定下一位玩家 (核心修正)
-            // 預設行為：換對手
+            // ============================================================
+            // ★ 核心修正點 2：只有遊戲「未結束」時，才執行狀態轉換與受困檢查
+            // ============================================================
             string nextPlayer = GetOpponent(player);
+            GamePhase nextPhase = phase;
 
             if (phase == GamePhase.PLACEMENT)
             {
-                // 規則：第 24 手結束，轉場並由最後下子者連動
-                if (moveIndex == 24)
-                {
-                    nextPhase = GamePhase.MOVEMENT;
-                    nextPlayer = player;
-                    tempBoard[2][2] = null; // 強制清空中心
-                    actionDesc += " (佈陣結束，連動開始)";
-                }
-                else
-                {
-                    // 修正 2+2 邏輯：相對判斷
-                    // 第 1 手下完 -> 還是自己 (準備下第 2 手)
-                    // 第 3 手下完 -> 還是自己 (準備下第 4 手)
-                    // 第 2, 4 手下完 -> 預設換人 (GetOpponent)
-                    if (moveIndex == 1 || moveIndex == 3)
-                    {
-                        nextPlayer = player;
-                    }
-                }
+                if (moveIndex == 24) { nextPhase = GamePhase.MOVEMENT; nextPlayer = player; baseMsg += " (連動攻擊開始)"; }
+                else if (moveIndex == 1 || moveIndex == 3) { nextPlayer = player; }
             }
             else if (phase == GamePhase.STUCK_REMOVAL)
             {
-                nextPlayer = player; // 解圍後連動
+                nextPhase = GamePhase.MOVEMENT;
+                nextPlayer = player;
             }
-            // MOVEMENT 吃子不連動，維持預設換人
 
-            // 4. 受困預判
+            // 只有在進入移動階段時，才預判受困
             if (nextPhase == GamePhase.MOVEMENT)
             {
-                Move? checkX = (nextPlayer == "X" && player == "X") ? move : lastMoveX;
-                Move? checkO = (nextPlayer == "O" && player == "O") ? move : lastMoveO;
+                Move? nX = (nextPlayer == "X" && player == "X") ? move : lastMoveX;
+                Move? nO = (nextPlayer == "O" && player == "O") ? move : lastMoveO;
 
-                var nextValidMoves = GetValidMoves(tempBoard, nextPlayer, GamePhase.MOVEMENT, checkX, checkO);
-                if (nextValidMoves.Count == 0)
+                // 這裡檢查下一位玩家是否有合法步數
+                if (GetValidMoves(newBoard, nextPlayer, GamePhase.MOVEMENT, nX, nO).Count == 0)
                 {
                     nextPhase = GamePhase.STUCK_REMOVAL;
-                    actionDesc += $"。⚠️ {nextPlayer} 受困，進入移除模式";
+                    baseMsg += $"。⚠️ {nextPlayer} 無路可走，進入移除模式";
                 }
             }
-
-            string finalMessage = $"玩家 {player} {actionDesc}";
-            if (captured.Count > 0) finalMessage += $"，吃掉 {captured.Count} 子";
-
-            string? winner = CheckWinner(tempBoard, nextPhase);
 
             return new MoveResponse
             {
                 Success = true,
-                NewBoard = tempBoard,
-                CapturedCount = captured.Count,
-                CapturedPieces = captured,
+                NewBoard = newBoard,
                 NextPlayer = nextPlayer,
                 NextPhase = nextPhase,
-                Winner = winner,
-                IsGameOver = winner != null,
-                Message = finalMessage,
                 Move = move,
-                MoveIndex = moveIndex // 回傳當前步數確認
+                MoveIndex = moveIndex + 1,
+                CapturedPieces = ud.Captured.Select(c => c.Pos).ToList(),
+                CapturedCount = ud.Captured.Count,
+                Winner = null,
+                IsGameOver = false,
+                Message = baseMsg
             };
         }
     }

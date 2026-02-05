@@ -1,0 +1,183 @@
+using SeegaGame.Models;
+
+namespace SeegaGame.Services
+{
+    public partial class AiService
+    {
+        private Move? RootSearch(GameTTContext ctx, AiMoveRequest req, long h, int d)
+        {
+            Move? bestM = null;
+            int bestScore = -WIN * 2;
+            int alpha = -WIN * 2;
+
+            var moves = _gs.GetValidMoves(req.Board, req.CurrentPlayer, req.Phase, req.LastMoveX, req.LastMoveO);
+            if (!moves.Any()) return null;
+
+            ProbeTT(ctx, h, 0, -2000000, 2000000, req.Phase, out _, out Move? ttMove);
+
+            var ordered = moves.OrderByDescending(m =>
+            {
+                if (ttMove != null && IsSameMove(m, ttMove)) return 1000000;
+                if (m.To.R == 2 && m.To.C == 2) return 100;
+                return GetMoveOrderingScore(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex, req.LastMoveX, req.LastMoveO);
+            });
+
+            foreach (var m in ordered)
+            {
+                var ud = _gs.MakeMove(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex);
+                var state = GetNextState(h, m, req.CurrentPlayer, req.Phase, req.MoveIndex, ud);
+
+                int score;
+                Move? nX = (req.CurrentPlayer == "X") ? m : req.LastMoveX;
+                Move? nO = (req.CurrentPlayer == "O") ? m : req.LastMoveO;
+
+                if (state.isSamePlayer)
+                    score = AlphaBeta(ctx, req.Board, state.nextHash, d - 1, alpha, WIN * 2, req.CurrentPlayer, nX, nO, state.nextPhase, req.MoveIndex + 1);
+                else
+                    score = -AlphaBeta(ctx, req.Board, state.nextHash, d - 1, -WIN * 2, -alpha, state.nextPlayer, nX, nO, state.nextPhase, req.MoveIndex + 1);
+
+                _gs.UnmakeMove(req.Board, ud, req.CurrentPlayer);
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestM = m;
+                }
+                alpha = Math.Max(alpha, bestScore);
+            }
+
+            if (bestM != null) StoreTT(ctx, h, d, bestScore, 0, bestM);
+            return bestM;
+        }
+        // 處理受困時的移除搜尋：此時 curr 移除一顆敵子後，繼續進行 MOVEMENT 搜尋
+        private int SearchRemoval(GameTTContext ctx, string?[][] board, long h, int d, string curr, Move? lX, Move? lO, int idx)
+        {
+            // 取得所有可移除的敵方棋子 (STUCK_REMOVAL 階段目標)
+            var removalMoves = _gs.GetValidMoves(board, curr, GamePhase.STUCK_REMOVAL, lX, lO);
+
+            if (removalMoves.Count == 0)
+                return EvaluatePosition(board, curr, GamePhase.MOVEMENT, idx);
+
+            int bestS = -2000000;
+
+            foreach (var m in removalMoves)
+            {
+                // 1. 執行移除物理動作
+                var ud = _gs.MakeMove(board, m, curr, GamePhase.STUCK_REMOVAL, idx);
+
+                // 2. 更新雜湊：僅移除棋子，不翻轉 SideHash (因為同一個人繼續動)
+                long nh = UpdatePieceHash(h, m, curr, ud.Captured, null);
+
+                // 3. 移除後，同一玩家 (curr) 立即進行 MOVEMENT 搜尋
+                // 這裡 d 不減 1 或僅減 1 (視難度調整)，確保能算出解圍後的下一步
+                int score = AlphaBeta(ctx, board, nh, d, -2000000, 2000000, curr, lX, lO, GamePhase.MOVEMENT, idx + 1);
+
+                // 4. 復原
+                _gs.UnmakeMove(board, ud, curr);
+
+                if (score > bestS) bestS = score;
+            }
+
+            return bestS;
+        }
+        private int AlphaBeta(GameTTContext ctx, string?[][] board, long h, int d,
+                     int alpha, int beta, string curr, Move? lX, Move? lO,
+                     GamePhase ph, int idx)
+        {
+            int originalAlpha = alpha;
+
+            // 1. TT 查表 (同時獲取 ttMove 用於後續排序)
+            if (ProbeTT(ctx, h, d, alpha, beta, ph, out int ttScore, out Move? ttMove)) return ttScore;
+
+            // 2. 勝負判定
+            string? winner = _gs.CheckWinner(board);
+            if (winner != null) return (winner == curr) ? (WIN + d) : (-WIN - d);
+
+            // 3. 靜態搜尋
+            if (d <= 0) return Quiesce(ctx, board, h, alpha, beta, curr, lX, lO, ph, idx);
+
+            // 4. 合法著法取得
+            var moves = _gs.GetValidMoves(board, curr, ph, lX, lO);
+
+            // 5. 受困處理
+            if (moves.Count == 0)
+            {
+                if (ph == GamePhase.MOVEMENT)
+                {
+                    // 如果在移動階段受困，執行「移除敵子」搜尋分支
+                    return SearchRemoval(ctx, board, h, d, curr, lX, lO, idx);
+                }
+                return EvaluatePosition(board, curr, ph, idx) + STUCK_ADVANTAGE;
+            }
+
+            // 6. 移動排序 (使用步驟 1 取得的 ttMove)
+            var ordered = moves.OrderByDescending(m => (ttMove != null && IsSameMove(m, ttMove)) ? 1000000 : 0);
+
+            int bestS = -WIN * 2;
+            Move? bestM = null;
+
+            foreach (var m in ordered)
+            {
+                var ud = _gs.MakeMove(board, m, curr, ph, idx);
+                var state = GetNextState(h, m, curr, ph, idx, ud);
+
+                int score;
+                Move? nX = (curr == "X") ? m : lX;
+                Move? nO = (curr == "O") ? m : lO;
+
+                if (state.isSamePlayer)
+                    score = AlphaBeta(ctx, board, state.nextHash, d - 1, alpha, beta, curr, nX, nO, state.nextPhase, idx + 1);
+                else
+                    score = -AlphaBeta(ctx, board, state.nextHash, d - 1, -beta, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1);
+
+                _gs.UnmakeMove(board, ud, curr);
+
+                if (score > bestS) { bestS = score; bestM = m; }
+                alpha = Math.Max(alpha, score);
+                if (alpha >= beta) break;
+            }
+
+            // 7. 存表
+            int flag = (bestS <= originalAlpha) ? 1 : (bestS >= beta ? 2 : 0);
+            StoreTT(ctx, h, d, bestS, flag, bestM);
+            return bestS;
+        }
+
+        private int Quiesce(GameTTContext ctx, string?[][] board, long h,
+                           int alpha, int beta, string curr,
+                           Move? lX, Move? lO, GamePhase ph, int idx)
+        {
+            if (ProbeTT(ctx, h, 0, alpha, beta, ph, out int ttScore, out _)) return ttScore;
+
+            int standPat = EvaluatePosition(board, curr, ph, idx);
+            if (standPat >= beta) return beta;
+            if (standPat > alpha) alpha = standPat;
+
+            var moves = _gs.GetValidMoves(board, curr, ph, lX, lO);
+
+            foreach (var m in moves)
+            {
+                var ud = _gs.MakeMove(board, m, curr, ph, idx);
+                if (ud.Captured.Count == 0) { _gs.UnmakeMove(board, ud, curr); continue; }
+
+                var state = GetNextState(h, m, curr, ph, idx, ud);
+                Move? nX = (curr == "X") ? m : lX;
+                Move? nO = (curr == "O") ? m : lO;
+
+                int score;
+                if (state.isSamePlayer)
+                    score = Quiesce(ctx, board, state.nextHash, alpha, beta, curr, nX, nO, state.nextPhase, idx + 1);
+                else
+                    score = -Quiesce(ctx, board, state.nextHash, -beta, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1);
+
+                _gs.UnmakeMove(board, ud, curr);
+
+                if (score >= beta) return beta;
+                if (score > alpha) alpha = score;
+            }
+
+            StoreTT(ctx, h, 0, alpha, 0, null);
+            return alpha;
+        }
+    }
+}
