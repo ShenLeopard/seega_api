@@ -17,8 +17,20 @@ namespace SeegaGame.Services
 
             var ordered = moves.OrderByDescending(m =>
             {
-                if (ttMove != null && IsSameMove(m, ttMove)) return 1000000;
-                if (m.To.R == 2 && m.To.C == 2) return 100;
+                // 1. TT 永遠最優先 (如果有的話)
+                if (ttMove != null && IsSameMove(m, ttMove)) return 2000000;
+
+                // 2. 如果是優勢收割期，直接看這步「MakeMove」能吃多少
+                if (d <= 2 && req.Phase == GamePhase.MOVEMENT)
+                {
+                    var ud = _gs.MakeMove(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex);
+                    int captured = ud.Captured.Count;
+                    _gs.UnmakeMove(req.Board, ud, req.CurrentPlayer);
+
+                    if (captured > 0) return 1000000 + captured; // 有吃子就排最前面
+                }
+
+                // 3. 正常情況下的排序
                 return GetMoveOrderingScore(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex, req.LastMoveX, req.LastMoveO);
             });
 
@@ -178,6 +190,33 @@ namespace SeegaGame.Services
 
             StoreTT(ctx, h, 0, alpha, 0, null);
             return alpha;
+        }
+        private int CalculateSearchDepth(AiMoveRequest req)
+        {
+            if (req.Phase == GamePhase.PLACEMENT)
+                return (req.MoveIndex >= 18) ? Math.Min(7, (24 - req.MoveIndex) + 2) : 3;
+
+            // --- 新增：收割模式判斷 (優勢降級) ---
+            if (req.Phase == GamePhase.MOVEMENT)
+            {
+                int myCount = 0;
+                int opCount = 0;
+                foreach (var row in req.Board)
+                    foreach (var cell in row)
+                    {
+                        if (cell == req.CurrentPlayer) myCount++;
+                        else if (cell != null) opCount++;
+                    }
+
+                // 差距 5 顆以上，且對手剩 4 顆以下
+                if ((myCount - opCount >= 5) && (opCount <= 4))
+                {
+                    // 將搜尋深度降到 2。配合 Quiesce，這足以執行簡單吃子，反應時間會縮短 99%
+                    return 2;
+                }
+            }
+
+            return req.Difficulty;
         }
     }
 }
