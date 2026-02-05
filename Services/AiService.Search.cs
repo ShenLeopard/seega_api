@@ -92,40 +92,31 @@ namespace SeegaGame.Services
             return bestS;
         }
         private int AlphaBeta(GameTTContext ctx, string?[][] board, long h, int d,
-                     int alpha, int beta, string curr, Move? lX, Move? lO,
-                     GamePhase ph, int idx)
+                             int alpha, int beta, string curr, Move? lX, Move? lO,
+                             GamePhase ph, int idx)
         {
             int originalAlpha = alpha;
 
-            // 1. TT 查表 (同時獲取 ttMove 用於後續排序)
             if (ProbeTT(ctx, h, d, alpha, beta, ph, out int ttScore, out Move? ttMove)) return ttScore;
 
-            // 2. 勝負判定
             string? winner = _gs.CheckWinner(board);
             if (winner != null) return (winner == curr) ? (WIN + d) : (-WIN - d);
 
-            // 3. 靜態搜尋
             if (d <= 0) return Quiesce(ctx, board, h, alpha, beta, curr, lX, lO, ph, idx);
 
-            // 4. 合法著法取得
             var moves = _gs.GetValidMoves(board, curr, ph, lX, lO);
-
-            // 5. 受困處理
             if (moves.Count == 0)
             {
-                if (ph == GamePhase.MOVEMENT)
-                {
-                    // 如果在移動階段受困，執行「移除敵子」搜尋分支
-                    return SearchRemoval(ctx, board, h, d, curr, lX, lO, idx);
-                }
+                if (ph == GamePhase.MOVEMENT) return SearchRemoval(ctx, board, h, d, curr, lX, lO, idx);
                 return EvaluatePosition(board, curr, ph, idx) + STUCK_ADVANTAGE;
             }
 
-            // 6. 移動排序 (使用步驟 1 取得的 ttMove)
+            // Move Ordering
             var ordered = moves.OrderByDescending(m => (ttMove != null && IsSameMove(m, ttMove)) ? 1000000 : 0);
 
             int bestS = -WIN * 2;
             Move? bestM = null;
+            int movesSearched = 0;
 
             foreach (var m in ordered)
             {
@@ -133,22 +124,36 @@ namespace SeegaGame.Services
                 var state = GetNextState(h, m, curr, ph, idx, ud);
 
                 int score;
-                Move? nX = (curr == "X") ? m : lX;
-                Move? nO = (curr == "O") ? m : lO;
+                Move? nX = (curr == "X") ? m : lX; Move? nO = (curr == "O") ? m : lO;
 
-                if (state.isSamePlayer)
-                    score = AlphaBeta(ctx, board, state.nextHash, d - 1, alpha, beta, curr, nX, nO, state.nextPhase, idx + 1);
+                // --- 修正：LMR (Late Move Reduction) ---
+                // 如果已經搜尋了 4 個以上的著法且沒有發現殺招，對於剩下的著法減少搜尋深度
+                if (movesSearched >= 4 && d >= 3 && !state.isSamePlayer && ud.Captured.Count == 0)
+                {
+                    // 先用較淺的深度 (d-2) 試探
+                    score = -AlphaBeta(ctx, board, state.nextHash, d - 2, -alpha - 1, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1);
+
+                    // 如果淺層搜尋發現這步棋似乎還有點潛力，才補做完整搜尋
+                    if (score > alpha)
+                        score = -AlphaBeta(ctx, board, state.nextHash, d - 1, -beta, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1);
+                }
                 else
-                    score = -AlphaBeta(ctx, board, state.nextHash, d - 1, -beta, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1);
+                {
+                    // 正常搜尋
+                    if (state.isSamePlayer)
+                        score = AlphaBeta(ctx, board, state.nextHash, d - 1, alpha, beta, curr, nX, nO, state.nextPhase, idx + 1);
+                    else
+                        score = -AlphaBeta(ctx, board, state.nextHash, d - 1, -beta, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1);
+                }
 
                 _gs.UnmakeMove(board, ud, curr);
+                movesSearched++;
 
                 if (score > bestS) { bestS = score; bestM = m; }
                 alpha = Math.Max(alpha, score);
                 if (alpha >= beta) break;
             }
 
-            // 7. 存表
             int flag = (bestS <= originalAlpha) ? 1 : (bestS >= beta ? 2 : 0);
             StoreTT(ctx, h, d, bestS, flag, bestM);
             return bestS;

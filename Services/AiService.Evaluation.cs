@@ -45,7 +45,6 @@ namespace SeegaGame.Services
             int myMobility = 0, opMobility = 0;
             string opponent = _gs.GetOpponent(currentPlayer);
             bool iAmAttacker = IsAttacker(currentPlayer, currentPlayer, moveIndex);
-            int proximityScore = 0;
 
             for (int r = 0; r < 5; r++)
             {
@@ -58,9 +57,29 @@ namespace SeegaGame.Services
                     {
                         myPieces++;
                         if (r == 2 && c == 2) score += CEN;
+
+                        // --- 修正 1：限制相連加分 (上限 2 個鄰居) ---
+                        // 讓棋子形成「鏈」或「排」，而非「實心方塊」，釋放棋盤空間
+                        int neighbors = CountAdjacentFriendly(board, r, c, currentPlayer);
+                        score += Math.Min(neighbors, 2) * 60;
+
+                        if (phase == GamePhase.PLACEMENT)
+                        {
+                            // --- 修正 2：攻擊方與防守方的差異評估 ---
+                            int v = CalculateVulnerability(board, r, c, opponent);
+                            if (iAmAttacker)
+                            {
+                                // 我是獵人：不害怕空隙，甚至獎勵「瞄準」敵人的空隙 (+800)
+                                score += v * 800;
+                            }
+                            else
+                            {
+                                // 我是獵物：極度害怕被夾擊 (-4000)
+                                score -= v * 4000;
+                            }
+                        }
+
                         if (phase == GamePhase.MOVEMENT) myMobility += CountAdjacentEmpty(board, r, c);
-                        // 找出距離最近的敵方棋子，距離越短分數越高
-                        proximityScore += CalculateProximityToEnemy(board, r, c, opponent);
                     }
                     else
                     {
@@ -72,70 +91,77 @@ namespace SeegaGame.Services
 
             if (phase == GamePhase.PLACEMENT)
             {
-                // --- 核心優化：結構化威脅掃描 (防止 O-X-O 陷阱) ---
-                int maxThreatToMe = GetMaxCaptureThreat(board, currentPlayer, opponent);
-                if (maxThreatToMe > 0)
-                {
-                    // 防守方(後手)懲罰極高 (-4000)，攻擊方(先手)懲罰中等 (-1500)
-                    int penaltyUnit = iAmAttacker ? 1500 : 4000;
-                    score -= (maxThreatToMe * penaltyUnit);
-                }
+                // --- 修正 3：加入「開局殺」預判 ---
+                // 如果我是第 24 手持有者，特別檢查第 25 手跳入中心或其他空格的吃子可能
+                score += GetPotentialCaptureScore(board, currentPlayer, opponent, phase, moveIndex) * 2000;
 
                 string nextPlayer = GetNextPlayer(currentPlayer, moveIndex, phase);
                 score += (nextPlayer == currentPlayer) ? FIRST_MOVE_BONUS : -FIRST_MOVE_BONUS;
             }
 
-            if (phase == GamePhase.MOVEMENT)
-            {
-                if (opMobility <= 2) score += 1000; // 對手剩 2 步，很有威脅
-                if (opMobility <= 1) score += 2000; // 對手剩 1 步，即將封死
-                if (opMobility == 0) score += SUFFOCATE_BONUS; // 0 步，完全封死
+            if (phase == GamePhase.MOVEMENT) score += (myMobility - opMobility) * MOBILITY_LIGHT;
 
-                score += (myMobility - opMobility) * MOBILITY_LIGHT;
-            }
-            // 加入積極度分數
-            score += (proximityScore * 5); // 權重不宜過高，僅作為「打破僵局」的引導
             score += (myPieces - opPieces) * MAT;
             return score;
         }
-        private int CalculateProximityToEnemy(string?[][] board, int r, int c, string opponent)
+        //計算單顆棋子的脆弱性 (是否容易被夾擊)
+        private int CalculateVulnerability(string?[][] board, int r, int c, string opponent)
         {
-            int minDistance = 10; // 5x5 最大距離是 8
-            for (int er = 0; er < 5; er++)
+            int v = 0;
+            int[] dr = { -1, 1, 0, 0 };
+            int[] dc = { 0, 0, -1, 1 };
+
+            for (int i = 0; i < 4; i++)
             {
-                for (int ec = 0; ec < 5; ec++)
+                int nr = r + dr[i]; // 鄰居座標
+                int nc = c + dc[i];
+                int fr = r - dr[i]; // 對向座標
+                int fc = c - dc[i];
+
+                if (In(nr, nc) && In(fr, fc))
                 {
-                    if (board[er][ec] == opponent)
+                    // 佈陣期：如果一邊是敵軍，另一邊是空格（或中心點 C3）
+                    // 這代表移動階段一開始，對手只要跳進去，這顆子就必死無疑
+                    if (board[nr][nc] == opponent && (board[fr][fc] == null || (fr == 2 && fc == 2)))
                     {
-                        int dist = Math.Abs(r - er) + Math.Abs(c - ec);
-                        if (dist < minDistance) minDistance = dist;
+                        v++;
                     }
                 }
             }
-            // 距離越近(minDist越小)，分數越高(8 - minDist)
-            return Math.Max(0, 8 - minDistance);
+            return v;
         }
-        // 偵測盤面上威脅最大的「空格」
-        private int GetMaxCaptureThreat(string?[][] board, string myColor, string opColor)
+        // 新增：偵測潛在的開局殺機會
+        private int GetPotentialCaptureScore(string?[][] b, string me, string op, GamePhase ph, int idx)
         {
-            int maxThreat = 0;
+            if (ph != GamePhase.PLACEMENT) return 0;
+            bool iGet24 = ((24 - idx) % 2 == 0);
+            if (!iGet24) return 0;
+
+            int potential = 0;
+            // 模擬第 25 手可能的跳入點 (包含中心點)
             for (int r = 0; r < 5; r++)
             {
                 for (int c = 0; c < 5; c++)
                 {
-                    // 只掃描空格 (佈陣時中心點 C3 視為潛在空格)
-                    if (board[r][c] != null && !(r == 2 && c == 2)) continue;
+                    if (b[r][c] != null && !(r == 2 && c == 2)) continue;
 
-                    int threatInThisSpot = 0;
-                    // 檢查水平: Op - [Spot] - My 或 My - [Spot] - Op (這會導致 My 被吃)
-                    if (IsThreatSpot(board, r, c, 0, -1, 0, 1, myColor, opColor)) threatInThisSpot++;
-                    // 檢查垂直
-                    if (IsThreatSpot(board, r, c, -1, 0, 1, 0, myColor, opColor)) threatInThisSpot++;
-
-                    if (threatInThisSpot > maxThreat) maxThreat = threatInThisSpot;
+                    // 如果這個空格周圍能形成對敵人的夾擊
+                    if (IsThreatSpot(b, r, c, -1, 0, 1, 0, me, op)) potential++;
+                    if (IsThreatSpot(b, r, c, 0, -1, 0, 1, me, op)) potential++;
                 }
             }
-            return maxThreat;
+            return potential;
+        }
+        private int CountAdjacentFriendly(string?[][] board, int r, int c, string me)
+        {
+            int count = 0;
+            int[] dr = { -1, 1, 0, 0 }; int[] dc = { 0, 0, -1, 1 };
+            for (int i = 0; i < 4; i++)
+            {
+                int nr = r + dr[i], nc = c + dc[i];
+                if (In(nr, nc) && board[nr][nc] == me) count++;
+            }
+            return count;
         }
 
         private bool IsThreatSpot(string?[][] b, int r, int c, int dr1, int dc1, int dr2, int dc2, string my, string op)
