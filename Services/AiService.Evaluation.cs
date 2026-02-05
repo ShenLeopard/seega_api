@@ -45,6 +45,7 @@ namespace SeegaGame.Services
             int myMobility = 0, opMobility = 0;
             string opponent = _gs.GetOpponent(currentPlayer);
             bool iAmAttacker = IsAttacker(currentPlayer, currentPlayer, moveIndex);
+            int proximityScore = 0;
 
             for (int r = 0; r < 5; r++)
             {
@@ -58,6 +59,8 @@ namespace SeegaGame.Services
                         myPieces++;
                         if (r == 2 && c == 2) score += CEN;
                         if (phase == GamePhase.MOVEMENT) myMobility += CountAdjacentEmpty(board, r, c);
+                        // 找出距離最近的敵方棋子，距離越短分數越高
+                        proximityScore += CalculateProximityToEnemy(board, r, c, opponent);
                     }
                     else
                     {
@@ -83,12 +86,35 @@ namespace SeegaGame.Services
             }
 
             if (phase == GamePhase.MOVEMENT)
-                score += (myMobility - opMobility) * MOBILITY_LIGHT;
+            {
+                if (opMobility <= 2) score += 1000; // 對手剩 2 步，很有威脅
+                if (opMobility <= 1) score += 2000; // 對手剩 1 步，即將封死
+                if (opMobility == 0) score += SUFFOCATE_BONUS; // 0 步，完全封死
 
+                score += (myMobility - opMobility) * MOBILITY_LIGHT;
+            }
+            // 加入積極度分數
+            score += (proximityScore * 5); // 權重不宜過高，僅作為「打破僵局」的引導
             score += (myPieces - opPieces) * MAT;
             return score;
         }
-
+        private int CalculateProximityToEnemy(string?[][] board, int r, int c, string opponent)
+        {
+            int minDistance = 10; // 5x5 最大距離是 8
+            for (int er = 0; er < 5; er++)
+            {
+                for (int ec = 0; ec < 5; ec++)
+                {
+                    if (board[er][ec] == opponent)
+                    {
+                        int dist = Math.Abs(r - er) + Math.Abs(c - ec);
+                        if (dist < minDistance) minDistance = dist;
+                    }
+                }
+            }
+            // 距離越近(minDist越小)，分數越高(8 - minDist)
+            return Math.Max(0, 8 - minDistance);
+        }
         // 偵測盤面上威脅最大的「空格」
         private int GetMaxCaptureThreat(string?[][] board, string myColor, string opColor)
         {
