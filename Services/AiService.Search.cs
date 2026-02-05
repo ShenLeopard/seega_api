@@ -4,13 +4,12 @@ namespace SeegaGame.Services
 {
     public partial class AiService
     {
-        private Move? RootSearch(GameTTContext ctx, AiMoveRequest req, long h, int d)
+        private Move? RootSearch(GameTTContext ctx, AiMoveRequest req, long h, int d, List<Move> moves)
         {
             Move? bestM = null;
             int bestScore = -WIN * 2;
             int alpha = -WIN * 2;
 
-            var moves = _gs.GetValidMoves(req.Board, req.CurrentPlayer, req.Phase, req.LastMoveX, req.LastMoveO);
             if (!moves.Any()) return null;
 
             ProbeTT(ctx, h, 0, -2000000, 2000000, req.Phase, out _, out Move? ttMove);
