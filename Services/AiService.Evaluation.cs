@@ -4,6 +4,12 @@ namespace SeegaGame.Services
 {
     public partial class AiService
     {// 用於搜尋前的快速著法排序 (Heuristic Move Ordering)
+
+        // 權重微調：讓機動性權重降低，避免 AI 為了刷步數而在後場亂跑
+        // PROXIMITY_WEIGHT: 距離每近一格加幾分
+        private const int PROXIMITY_WEIGHT = 15;
+        // CONTACT_BONUS: 貼著敵人加幾分
+        private const int CONTACT_BONUS = 30;
         private int GetMoveOrderingScore(string?[][] board, Move m, string player,
                                         GamePhase phase, int moveIndex, Move? lastX, Move? lastO)
         {
@@ -43,9 +49,15 @@ namespace SeegaGame.Services
             int score = 0;
             int myPieces = 0, opPieces = 0;
             int myMobility = 0, opMobility = 0;
+
+            // 用於計算引力 (Proximity)
+            List<Position> myPos = new();
+            List<Position> opPos = new();
+
             string opponent = _gs.GetOpponent(currentPlayer);
             bool iAmAttacker = IsAttacker(currentPlayer, currentPlayer, moveIndex);
 
+            // 1. 盤面掃描
             for (int r = 0; r < 5; r++)
             {
                 for (int c = 0; c < 5; c++)
@@ -56,54 +68,93 @@ namespace SeegaGame.Services
                     if (piece == currentPlayer)
                     {
                         myPieces++;
+                        myPos.Add(new Position { R = r, C = c });
+
                         if (r == 2 && c == 2) score += CEN;
 
-                        // --- 修正 1：限制相連加分 (上限 2 個鄰居) ---
-                        // 讓棋子形成「鏈」或「排」，而非「實心方塊」，釋放棋盤空間
-                        int neighbors = CountAdjacentFriendly(board, r, c, currentPlayer);
-                        score += Math.Min(neighbors, 2) * 60;
-
+                        // --- 修正 A: 只有佈陣階段才重罰脆弱性 ---
+                        // 移動階段交給 AlphaBeta 搜尋去判斷死活，靜態評估不要過度恐嚇
                         if (phase == GamePhase.PLACEMENT)
                         {
-                            // --- 修正 2：攻擊方與防守方的差異評估 ---
+                            int neighbors = CountAdjacentFriendly(board, r, c, currentPlayer);
+                            score += Math.Min(neighbors, 2) * 60; // 限制相連加分
+
                             int v = CalculateVulnerability(board, r, c, opponent);
-                            if (iAmAttacker)
-                            {
-                                // 我是獵人：不害怕空隙，甚至獎勵「瞄準」敵人的空隙 (+800)
-                                score += v * 800;
-                            }
-                            else
-                            {
-                                // 我是獵物：極度害怕被夾擊 (-4000)
-                                score -= v * 4000;
-                            }
+                            score -= iAmAttacker ? v * 100 : v * 700; // 佈陣時依然要小心
                         }
 
-                        if (phase == GamePhase.MOVEMENT) myMobility += CountAdjacentEmpty(board, r, c);
+                        // --- 修正 B: 移動階段獎勵「貼身肉搏」 ---
+                        if (phase == GamePhase.MOVEMENT)
+                        {
+                            myMobility += CountAdjacentEmpty(board, r, c);
+                            // 如果貼著敵人，給予獎勵 (施壓)
+                            if (IsNextToEnemy(board, r, c, opponent)) score += CONTACT_BONUS;
+                        }
                     }
-                    else
+                    else // 對手
                     {
                         opPieces++;
+                        opPos.Add(new Position { R = r, C = c });
                         if (phase == GamePhase.MOVEMENT) opMobility += CountAdjacentEmpty(board, r, c);
                     }
                 }
             }
 
+            // 2. 特殊階段加分
             if (phase == GamePhase.PLACEMENT)
             {
-                // --- 修正 3：加入「開局殺」預判 ---
-                // 如果我是第 24 手持有者，特別檢查第 25 手跳入中心或其他空格的吃子可能
                 score += GetPotentialCaptureScore(board, currentPlayer, opponent, phase, moveIndex) * 2000;
-
                 string nextPlayer = GetNextPlayer(currentPlayer, moveIndex, phase);
                 score += (nextPlayer == currentPlayer) ? FIRST_MOVE_BONUS : -FIRST_MOVE_BONUS;
             }
 
-            if (phase == GamePhase.MOVEMENT) score += (myMobility - opMobility) * MOBILITY_LIGHT;
+            // --- 修正 C: 加入「敵我距離引力」 (Proximity Gravity) ---
+            if (phase == GamePhase.MOVEMENT && myPos.Count > 0 && opPos.Count > 0)
+            {
+                score += CalculateProximityScore(myPos, opPos);
+
+                // 機動性權重降低 (從 8 降到 5)，避免為了步數而不敢進攻
+                score += (myMobility - opMobility) * 5;
+            }
 
             score += (myPieces - opPieces) * MAT;
             return score;
         }
+
+        private bool IsNextToEnemy(string?[][] board, int r, int c, string opponent)
+        {
+            int[] dr = { -1, 1, 0, 0 };
+            int[] dc = { 0, 0, -1, 1 };
+            for (int i = 0; i < 4; i++)
+            {
+                int nr = r + dr[i], nc = c + dc[i];
+                if (In(nr, nc) && board[nr][nc] == opponent) return true;
+            }
+            return false;
+        }
+        // 計算所有己方棋子與「最近敵軍」的距離總和
+        // 距離越小，分數越高 -> 驅使 AI 往敵群移動
+        private int CalculateProximityScore(List<Position> myPos, List<Position> opPos)
+        {
+            int totalProximity = 0;
+
+            foreach (var my in myPos)
+            {
+                int minDist = 100;
+                foreach (var op in opPos)
+                {
+                    // 曼哈頓距離
+                    int dist = Math.Abs(my.R - op.R) + Math.Abs(my.C - op.C);
+                    if (dist < minDist) minDist = dist;
+                }
+
+                // 距離越近分越高 (5x5 最大距離是 8)
+                // 每個棋子最高貢獻 PROXIMITY_WEIGHT * 8
+                totalProximity += (10 - minDist) * PROXIMITY_WEIGHT;
+            }
+            return totalProximity;
+        }
+
         //計算單顆棋子的脆弱性 (是否容易被夾擊)
         private int CalculateVulnerability(string?[][] board, int r, int c, string opponent)
         {
