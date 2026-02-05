@@ -178,7 +178,11 @@ namespace SeegaGame.Services
             // ============================================================
             // ★ 核心修正點 1：勝負判定擁有「絕對優先權」
             // ============================================================
-            string? winner = CheckWinner(newBoard);
+            string? winner = null;
+            if (phase != GamePhase.PLACEMENT)
+            {
+                winner = CheckWinner(newBoard);
+            }
             if (winner != null)
             {
                 // 只要有人贏了，立刻回傳，後面的受困邏輯「絕對」不會跑
