@@ -58,5 +58,11 @@ namespace SeegaGame.Controllers
 
             return Ok(resp);
         }
+
+        [HttpPost("ping")]
+        public ActionResult<string> Ping()
+        {
+            return Ok("OK");
+        }
     }
 }
