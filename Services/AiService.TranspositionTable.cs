@@ -25,38 +25,27 @@ namespace SeegaGame.Services
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private bool ProbeTT(GameTTContext ctx, long h, int d, int alpha, int beta, GamePhase ph, out int score, out Move? bestMove)
+        private bool ProbeTT(GameTTContext ctx, long h, int d, int alpha, int beta, out int score, out Move? bestMove)
         {
             int index = (int)(h & GameTTContext.MASK);
             score = 0;
             bestMove = null;
 
-            lock (ctx.GetLock(index))
+            // 無鎖讀取（性能優化）
+            ref TTEntry entry = ref ctx.Entries[index];
+
+            if (entry.Key == h)
             {
-                ref TTEntry entry = ref ctx.Entries[index];
-                if (entry.Key == h)
+                bestMove = DecodeMove(entry.BestMove);
+
+                if (entry.Depth >= d)
                 {
-                    Move? tempMove = DecodeMove(entry.BestMove);
-
-                    // --- 修正：根據當前 Phase 過濾不相符的 BestMove ---
-                    // 1. 如果是移動階段，但 TT 存的是「無來源」的步數（放置或移除），則該步數無效
-                    if (ph == GamePhase.MOVEMENT && tempMove != null && tempMove.From == null)
-                        tempMove = null;
-
-                    // 2. 如果是移除階段，但 TT 存的是「有來源」的步數，則該步數無效
-                    if (ph == GamePhase.STUCK_REMOVAL && tempMove != null && tempMove.From != null)
-                        tempMove = null;
-
-                    bestMove = tempMove;
-
-                    if (entry.Depth >= d)
-                    {
-                        if (entry.Flag == 0) { score = entry.Score; return true; } // EXACT
-                        if (entry.Flag == 1 && entry.Score <= alpha) { score = alpha; return true; } // UPPER
-                        if (entry.Flag == 2 && entry.Score >= beta) { score = beta; return true; } // LOWER
-                    }
+                    if (entry.Flag == 0) { score = entry.Score; return true; }
+                    if (entry.Flag == 1 && entry.Score <= alpha) { score = alpha; return true; }
+                    if (entry.Flag == 2 && entry.Score >= beta) { score = beta; return true; }
                 }
             }
+
             return false;
         }
 

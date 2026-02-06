@@ -12,24 +12,21 @@ namespace SeegaGame.Services
 
             if (!moves.Any()) return null;
 
-            ProbeTT(ctx, h, 0, -2000000, 2000000, req.Phase, out _, out Move? ttMove);
+            ProbeTT(ctx, h, 0, -2000000, 2000000, out _, out Move? ttMove);  // 移除 req.Phase 參數
 
             var ordered = moves.OrderByDescending(m =>
             {
-                // 1. TT 永遠最優先 (如果有的話)
                 if (ttMove != null && IsSameMove(m, ttMove)) return 2000000;
 
-                // 2. 如果是優勢收割期，直接看這步「MakeMove」能吃多少
                 if (d <= 2 && req.Phase == GamePhase.MOVEMENT)
                 {
                     var ud = _gs.MakeMove(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex);
                     int captured = ud.Captured.Count;
                     _gs.UnmakeMove(req.Board, ud, req.CurrentPlayer);
 
-                    if (captured > 0) return 1000000 + captured; // 有吃子就排最前面
+                    if (captured > 0) return 1000000 + captured;
                 }
 
-                // 3. 正常情況下的排序
                 return GetMoveOrderingScore(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex, req.LastMoveX, req.LastMoveO);
             });
 
@@ -60,10 +57,8 @@ namespace SeegaGame.Services
             if (bestM != null) StoreTT(ctx, h, d, bestScore, 0, bestM);
             return bestM;
         }
-        // 處理受困時的移除搜尋：此時 curr 移除一顆敵子後，繼續進行 MOVEMENT 搜尋
         private int SearchRemoval(GameTTContext ctx, string?[][] board, long h, int d, string curr, Move? lX, Move? lO, int idx)
         {
-            // 取得所有可移除的敵方棋子 (STUCK_REMOVAL 階段目標)
             var removalMoves = _gs.GetValidMoves(board, curr, GamePhase.STUCK_REMOVAL, lX, lO);
 
             if (removalMoves.Count == 0)
@@ -73,31 +68,26 @@ namespace SeegaGame.Services
 
             foreach (var m in removalMoves)
             {
-                // 1. 執行移除物理動作
                 var ud = _gs.MakeMove(board, m, curr, GamePhase.STUCK_REMOVAL, idx);
 
-                // 2. 更新雜湊：僅移除棋子，不翻轉 SideHash (因為同一個人繼續動)
-                long nh = UpdatePieceHash(h, m, curr, ud.Captured, null);
+                // 修正：明確傳入 STUCK_REMOVAL 階段，UpdatePieceHash 就不會在那格變出己方棋子
+                long nh = UpdatePieceHash(h, m, curr, ud.Captured, null, GamePhase.STUCK_REMOVAL);
 
-                // 3. 移除後，同一玩家 (curr) 立即進行 MOVEMENT 搜尋
-                // 這裡 d 不減 1 或僅減 1 (視難度調整)，確保能算出解圍後的下一步
+                // 移除後不 XOR SideHash，因為同一個人立刻進行 MOVEMENT
                 int score = AlphaBeta(ctx, board, nh, d, -2000000, 2000000, curr, lX, lO, GamePhase.MOVEMENT, idx + 1);
 
-                // 4. 復原
                 _gs.UnmakeMove(board, ud, curr);
-
                 if (score > bestS) bestS = score;
             }
-
             return bestS;
         }
         private int AlphaBeta(GameTTContext ctx, string?[][] board, long h, int d,
-                             int alpha, int beta, string curr, Move? lX, Move? lO,
-                             GamePhase ph, int idx)
+                     int alpha, int beta, string curr, Move? lX, Move? lO,
+                     GamePhase ph, int idx)
         {
             int originalAlpha = alpha;
 
-            if (ProbeTT(ctx, h, d, alpha, beta, ph, out int ttScore, out Move? ttMove)) return ttScore;
+            if (ProbeTT(ctx, h, d, alpha, beta, out int ttScore, out Move? ttMove)) return ttScore;  // 移除 ph 參數
 
             string? winner = _gs.CheckWinner(board);
             if (winner != null) return (winner == curr) ? (WIN + d) : (-WIN - d);
@@ -111,7 +101,6 @@ namespace SeegaGame.Services
                 return EvaluatePosition(board, curr, ph, idx) + STUCK_ADVANTAGE;
             }
 
-            // Move Ordering
             var ordered = moves.OrderByDescending(m => (ttMove != null && IsSameMove(m, ttMove)) ? 1000000 : 0);
 
             int bestS = -WIN * 2;
@@ -124,22 +113,18 @@ namespace SeegaGame.Services
                 var state = GetNextState(h, m, curr, ph, idx, ud);
 
                 int score;
-                Move? nX = (curr == "X") ? m : lX; Move? nO = (curr == "O") ? m : lO;
+                Move? nX = (curr == "X") ? m : lX;
+                Move? nO = (curr == "O") ? m : lO;
 
-                // --- 修正：LMR (Late Move Reduction) ---
-                // 如果已經搜尋了 4 個以上的著法且沒有發現殺招，對於剩下的著法減少搜尋深度
                 if (movesSearched >= 4 && d >= 3 && !state.isSamePlayer && ud.Captured.Count == 0)
                 {
-                    // 先用較淺的深度 (d-2) 試探
                     score = -AlphaBeta(ctx, board, state.nextHash, d - 2, -alpha - 1, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1);
 
-                    // 如果淺層搜尋發現這步棋似乎還有點潛力，才補做完整搜尋
                     if (score > alpha)
                         score = -AlphaBeta(ctx, board, state.nextHash, d - 1, -beta, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1);
                 }
                 else
                 {
-                    // 正常搜尋
                     if (state.isSamePlayer)
                         score = AlphaBeta(ctx, board, state.nextHash, d - 1, alpha, beta, curr, nX, nO, state.nextPhase, idx + 1);
                     else
@@ -160,10 +145,10 @@ namespace SeegaGame.Services
         }
 
         private int Quiesce(GameTTContext ctx, string?[][] board, long h,
-                           int alpha, int beta, string curr,
-                           Move? lX, Move? lO, GamePhase ph, int idx)
+                   int alpha, int beta, string curr,
+                   Move? lX, Move? lO, GamePhase ph, int idx)
         {
-            if (ProbeTT(ctx, h, 0, alpha, beta, ph, out int ttScore, out _)) return ttScore;
+            if (ProbeTT(ctx, h, 0, alpha, beta, out int ttScore, out _)) return ttScore;  // 移除 ph 參數
 
             int standPat = EvaluatePosition(board, curr, ph, idx);
             if (standPat >= beta) return beta;
@@ -198,9 +183,14 @@ namespace SeegaGame.Services
         private int CalculateSearchDepth(AiMoveRequest req)
         {
             if (req.Phase == GamePhase.PLACEMENT)
-                return (req.MoveIndex >= 18) ? Math.Min(7, (24 - req.MoveIndex) + 2) : 3;
+            {
+                // 如果是第 24 手，這是佈陣轉交戰的生死關頭，必須深算
+                if (req.MoveIndex == 24) return Math.Max(req.Difficulty, 6);
 
-            // --- 新增：收割模式判斷 (優勢降級) ---
+                // 其他佈陣階段：末期稍深，初期較淺
+                return (req.MoveIndex >= 18) ? Math.Min(7, (24 - req.MoveIndex) + 2) : 3;
+            }
+
             if (req.Phase == GamePhase.MOVEMENT)
             {
                 int myCount = 0;
@@ -212,10 +202,9 @@ namespace SeegaGame.Services
                         else if (cell != null) opCount++;
                     }
 
-                // 差距 5 顆以上，且對手剩 4 顆以下
+                // 優勢收割模式：對手剩不到 4 顆且我方大贏 5 顆以上時，降深度以加快反應
                 if ((myCount - opCount >= 5) && (opCount <= 4))
                 {
-                    // 將搜尋深度降到 2。配合 Quiesce，這足以執行簡單吃子，反應時間會縮短 99%
                     return 2;
                 }
             }

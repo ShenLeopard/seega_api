@@ -11,7 +11,6 @@ namespace SeegaGame.Services
         // Zobrist 雜湊表
         private static readonly long[,,] ZobristPiece;
         private static readonly long SideHash;
-        private static readonly long PhaseToggleHash; // 用於區分 PLACEMENT(0) 與 MOVEMENT(1)
 
         // 評分常數
         protected const int WIN = 1000000;
@@ -35,7 +34,6 @@ namespace SeegaGame.Services
                 }
 
             SideHash = RL(rand);
-            PhaseToggleHash = RL(rand); // 產生單一階段切換開關
         }
 
         private static long RL(Random r)
@@ -65,8 +63,9 @@ namespace SeegaGame.Services
             req.LastMoveO = ValidateLastMove(req.Board, req.LastMoveO, "O");
 
             var ctx = GetContext(req.GameUUId);
-            long h = InitialHash(req.Board, req.CurrentPlayer, req.Phase);
+            long h = InitialHash(req.Board, req.CurrentPlayer);  // 移除 req.Phase 參數
 
+            // 1. 處理受困移除模式
             if (req.Phase == GamePhase.STUCK_REMOVAL)
             {
                 return _gs.GetValidMoves(req.Board, req.CurrentPlayer, req.Phase, null, null)
@@ -74,11 +73,11 @@ namespace SeegaGame.Services
                     .FirstOrDefault();
             }
 
-            // 1. [新增] 取得所有合法移動，用於立即獲勝檢查
+            // 2. 取得合法步
             var moves = _gs.GetValidMoves(req.Board, req.CurrentPlayer, req.Phase, req.LastMoveX, req.LastMoveO);
             if (!moves.Any()) return null;
 
-            // 2. [新增] 立即獲勝檢查 (絕殺偵測)：如果下一步就能贏，0秒直接回傳
+            // 3. 絕殺偵測：如果在移動階段能一步獲勝，直接回傳
             if (req.Phase == GamePhase.MOVEMENT)
             {
                 foreach (var m in moves)
@@ -87,38 +86,15 @@ namespace SeegaGame.Services
                     if (_gs.CheckWinner(req.Board) == req.CurrentPlayer)
                     {
                         _gs.UnmakeMove(req.Board, ud, req.CurrentPlayer);
-                        return m; // 發現一步結束，直接收工
+                        return m;
                     }
                     _gs.UnmakeMove(req.Board, ud, req.CurrentPlayer);
                 }
             }
 
-            // 3. [修正] 深度計算邏輯：加入「優勢收割模式」
-            int d = req.Difficulty;
+            // 4. 計算深度並開始搜尋 (包含第 24 手的深度優化)
+            int d = CalculateSearchDepth(req);
 
-            if (req.Phase == GamePhase.PLACEMENT)
-            {
-                d = (req.MoveIndex >= 18) ? Math.Min(7, (24 - req.MoveIndex) + 2) : 3;
-            }
-            else if (req.Phase == GamePhase.MOVEMENT)
-            {
-                // [新增] 計算子力差距
-                int myCount = 0, opCount = 0;
-                for (int r = 0; r < 5; r++)
-                    for (int c = 0; c < 5; c++)
-                    {
-                        if (req.Board[r][c] == req.CurrentPlayer) myCount++;
-                        else if (req.Board[r][c] != null) opCount++;
-                    }
-
-                // [新增] 絕對優勢判定 (例如 10 vs 3)
-                if (myCount - opCount >= 5 || opCount <= 3)
-                {
-                    d = 2; // 強行降到深度 2，反應時間會縮短 100 倍且不會輸
-                }
-            }
-
-            // 4. [修正] 呼叫 RootSearch 時，不再重新抓 GetValidMoves (效能優化)
             return RootSearch(ctx, req, h, d, moves);
         }
 

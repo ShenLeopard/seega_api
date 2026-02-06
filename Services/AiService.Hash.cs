@@ -4,9 +4,10 @@ namespace SeegaGame.Services
 {
     public partial class AiService
     {
-        private long InitialHash(string?[][] board, string currentPlayer, GamePhase phase)
+        private long InitialHash(string?[][] board, string currentPlayer)
         {
             long h = 0;
+
             for (int r = 0; r < 5; r++)
                 for (int c = 0; c < 5; c++)
                     if (board[r][c] != null)
@@ -14,28 +15,42 @@ namespace SeegaGame.Services
 
             if (currentPlayer == "O") h ^= SideHash;
 
-            // 如果不是佈陣階段，就翻轉為移動階段雜湊
-            if (phase != GamePhase.PLACEMENT) h ^= PhaseToggleHash;
-
             return h;
         }
 
         private long UpdatePieceHash(long h, Move m, string player,
-                                     List<(Position Pos, string Player)> captures,
-                                     string? clearedCenter)
+                             List<(Position Pos, string Player)> captures,
+                             string? clearedCenter, GamePhase phase)  // 新增 phase 參數
         {
             int pi = player == "X" ? 0 : 1;
 
-            if (m.From != null)
-                h ^= ZobristPiece[m.From.R, m.From.C, pi];
+            if (phase == GamePhase.MOVEMENT)
+            {
+                // 移動模式：起點 XOR 掉，終點 XOR 進來
+                if (m.From != null) h ^= ZobristPiece[m.From.R, m.From.C, pi];
+                h ^= ZobristPiece[m.To.R, m.To.C, pi];
+            }
+            else if (phase == GamePhase.PLACEMENT)
+            {
+                // 佈陣模式：只有終點 XOR 進來 (m.From 為空)
+                h ^= ZobristPiece[m.To.R, m.To.C, pi];
+            }
+            // 注意：如果是 STUCK_REMOVAL，我們不對 m.To 做己方棋子的 XOR，
+            // 因為該位置是敵人的，會由下方的 captures 迴圈統一處理移除。
 
-            h ^= ZobristPiece[m.To.R, m.To.C, pi];
-
+            // 處理所有被吃掉或被移除的棋子
             foreach (var cap in captures)
-                h ^= ZobristPiece[cap.Pos.R, cap.Pos.C, 1 - pi];
+            {
+                int victimPi = cap.Player == "X" ? 0 : 1;
+                h ^= ZobristPiece[cap.Pos.R, cap.Pos.C, victimPi];
+            }
 
+            // 處理第 24 手自動清空的中心點
             if (clearedCenter != null)
-                h ^= ZobristPiece[2, 2, clearedCenter == "X" ? 0 : 1];
+            {
+                int centerPi = clearedCenter == "X" ? 0 : 1;
+                h ^= ZobristPiece[2, 2, centerPi];
+            }
 
             return h;
         }
@@ -43,30 +58,21 @@ namespace SeegaGame.Services
         private (long nextHash, string nextPlayer, GamePhase nextPhase, bool isSamePlayer)
     GetNextState(long currentHash, Move move, string curr, GamePhase ph, int idx, UndoData ud)
         {
-            // 1. 基礎棋子雜湊更新 (由 UpdatePieceHash 處理 move 與 captures)
-            long nh = UpdatePieceHash(currentHash, move, curr, ud.Captured, ud.ClearedCenterPiece);
+            // 傳入當前 phase 以正確計算雜湊
+            long nh = UpdatePieceHash(currentHash, move, curr, ud.Captured, ud.ClearedCenterPiece, ph);
 
-            // 2. 處理階段轉場 (第 24 手佈陣結束)
-            bool phaseFlip = (ph == GamePhase.PLACEMENT && idx == 24);
-            if (phaseFlip)
-            {
-                nh ^= PhaseToggleHash; // 翻轉雜湊狀態至 MOVEMENT
-            }
-
-            // 3. 處理連動與玩家切換
             bool isCombo = IsComboMove(idx, ph);
             if (isCombo)
             {
-                // 連動：不換人，不 XOR SideHash
-                GamePhase nextPhase = phaseFlip ? GamePhase.MOVEMENT : ph;
-                return (nh, curr, nextPhase, true);
+                // 如果是第 24 手佈陣完畢，下一階段變為 MOVEMENT，但不換人
+                GamePhase nextPhase = (ph == GamePhase.PLACEMENT && idx == 24) ? GamePhase.MOVEMENT : ph;
+                return (nh, curr, nextPhase, true); // 不 XOR SideHash，同一人續動
             }
             else
             {
-                // 正常：換人，XOR SideHash
-                // 注意：STUCK_REMOVAL 的移除動作會在這裡自然完成 (因為移除也算一次行動)
                 return (nh ^ SideHash, _gs.GetOpponent(curr), ph, false);
             }
         }
+
     }
 }
