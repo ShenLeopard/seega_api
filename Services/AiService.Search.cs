@@ -17,32 +17,27 @@ namespace SeegaGame.Services
             int bestScore = -WIN * 2;
             int alpha = -WIN * 2;
 
-            Console.WriteLine($"[AI Start] Index: {req.MoveIndex}, Depth: {d}, Moves: {moves.Count}");
-
             if (!moves.Any()) return null;
 
             ProbeTT(ctx, h, 0, -2000000, 2000000, out _, out Move? ttMove);
 
+            // 使用修正後的重型排序
             var ordered = moves.OrderByDescending(m =>
             {
                 if (ttMove != null && IsSameMove(m, ttMove)) return 2000000;
                 return GetHeavyMoveOrderingScore(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex, req.LastMoveX, req.LastMoveO);
             }).ToList();
 
-            int moveCount = 0;
             foreach (var m in ordered)
             {
-                moveCount++;
                 var ud = _gs.MakeMove(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex);
                 var state = GetNextState(h, m, req.CurrentPlayer, req.Phase, req.MoveIndex, ud);
 
-                // ★★★ 補上這兩行定義 nX 和 nO ★★★
                 Move? nX = (req.CurrentPlayer == "X") ? m : req.LastMoveX;
                 Move? nO = (req.CurrentPlayer == "O") ? m : req.LastMoveO;
 
                 int score;
                 if (state.isSamePlayer)
-                    // 這裡原本報錯是因為 nX, nO 未定義，現在補上了
                     score = AlphaBeta(ctx, req.Board, state.nextHash, d - 1, alpha, WIN * 2, req.CurrentPlayer, nX, nO, state.nextPhase, req.MoveIndex + 1);
                 else
                     score = -AlphaBeta(ctx, req.Board, state.nextHash, d - 1, -WIN * 2, -alpha, state.nextPlayer, nX, nO, state.nextPhase, req.MoveIndex + 1);
@@ -54,24 +49,14 @@ namespace SeegaGame.Services
                     bestScore = score;
                     bestM = m;
                 }
-
                 alpha = Math.Max(alpha, bestScore);
 
-                // 必勝剪枝：如果分數已經大於 WIN (代表必勝)，直接跳出，不用再算剩下的爛棋
-                if (bestScore >= WIN)
-                {
-                    Console.WriteLine($"[Fast Win] Found winning move {FormatMove(m)} with score {bestScore}. Stopping.");
-                    break;
-                }
+                if (bestScore >= WIN) break;
             }
 
             if (bestM != null) StoreTT(ctx, h, d, bestScore, 0, bestM);
-
-            _sw.Stop();
-            Console.WriteLine($"[AI Done] Best: {FormatMove(bestM)}, Score: {bestScore}, Time: {_sw.ElapsedMilliseconds}ms");
             return bestM;
         }
-
         private int SearchRemoval(GameTTContext ctx, string?[][] board, long h, int d, string curr, Move? lX, Move? lO, int idx)
         {
             // Debug: 檢查是否頻繁進入移除模式

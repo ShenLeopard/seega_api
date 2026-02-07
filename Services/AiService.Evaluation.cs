@@ -74,18 +74,27 @@ namespace SeegaGame.Services
         // 【重新命名】重型排序：只在 RootSearch (第一層) 使用
         // 這裡保留你原本的邏輯：包含吃子模擬 + 檢查對手是否窒息 (Stuck/Suffocate)
         private int GetHeavyMoveOrderingScore(string?[][] board, Move m, string player,
-                                GamePhase phase, int moveIndex, Move? lastX, Move? lastO)
+                        GamePhase phase, int moveIndex, Move? lastX, Move? lastO)
         {
             if (phase == GamePhase.PLACEMENT)
             {
+                // 1. 基本中心引力 (但避開正中心 2,2)
+                if (m.To.R == 2 && m.To.C == 2) return -1000;
+
                 int rDist = Math.Abs(m.To.R - 2);
                 int cDist = Math.Abs(m.To.C - 2);
-                return 100 - (rDist + cDist) * 10;
+                int score = 100 - (rDist + cDist) * 10;
+
+                // 2. 致命傷偵測：絕對不下會被開局殺的位置
+                if (IsVulnerableToOpeningKill(board, m.To.R, m.To.C, player))
+                    return -50000;
+
+                return score;
             }
 
             if (phase == GamePhase.MOVEMENT)
             {
-                // 根節點只執行幾十次，這裡做 MakeMove 是安全的
+                // 移動階段邏輯 (已在之前修復，保持不變)
                 var ud = _gs.MakeMove(board, m, player, phase, moveIndex);
                 int score = ud.Captured.Count * 2000;
 
@@ -93,25 +102,16 @@ namespace SeegaGame.Services
                 Move? nX = (player == "X") ? m : lastX;
                 Move? nO = (player == "O") ? m : lastO;
 
-                // 檢查這步棋是否讓對手無路可走 (窒息戰術)
                 var opMoves = _gs.GetValidMoves(board, op, GamePhase.MOVEMENT, nX, nO);
-
                 if (opMoves.Count == 0)
                 {
                     int opCount = 0;
-                    for (int r = 0; r < 5; r++)
-                        for (int c = 0; c < 5; c++)
-                            if (board[r][c] == op) opCount++;
-
-                    // 如果對手剩很少子，讓他無路可走是壞事 (因為要拔子)；否則是大好事
-                    if (opCount <= 4) score -= 5000;
-                    else score += 3000;
+                    foreach (var row in board) foreach (var cell in row) if (cell == op) opCount++;
+                    score += (opCount <= 4) ? -5000 : 3000;
                 }
-
                 _gs.UnmakeMove(board, ud, player);
                 return score;
             }
-
             return 0;
         }
         private int EvaluatePosition(string?[][] board, string currentPlayer, GamePhase phase, int moveIndex)
@@ -139,13 +139,16 @@ namespace SeegaGame.Services
                         myPieces++;
                         myPos.Add(new Position { R = r, C = c });
 
-                        if (r == 2 && c == 2) score += CEN;
+                        // 只有在移動階段中心點才有分數
+                        if (phase == GamePhase.MOVEMENT && r == 2 && c == 2) score += CEN;
 
                         if (phase == GamePhase.PLACEMENT)
                         {
+                            // 佈陣期：強化相鄰加分，形成防禦鏈
                             int neighbors = CountAdjacentFriendly(board, r, c, currentPlayer);
                             score += Math.Min(neighbors, 2) * 60;
 
+                            // 脆弱性檢查
                             int v = CalculateVulnerability(board, r, c, opponent);
                             score -= iAmAttacker ? v * 100 : v * 700;
                         }
@@ -165,12 +168,17 @@ namespace SeegaGame.Services
                 }
             }
 
-            // 2. 特殊階段加分
+            // 2. 佈陣階段特殊邏輯：開局殺預判
             if (phase == GamePhase.PLACEMENT)
             {
+                // [關鍵] 判斷誰會拿到第 25 手的先攻權
+                // 在 Seega 規則下，放下第 24 子的人擁有第 25 手移動權
+                bool iMoveFirst = (moveIndex % 4 == 0 || moveIndex % 4 == 3); // 簡易判斷，依據 2+2 規則
+
+                score += GetOpeningKillScore(board, currentPlayer, opponent, iMoveFirst);
+
+                // 基礎佈陣加分 (原有邏輯)
                 score += GetPotentialCaptureScore(board, currentPlayer, opponent, phase, moveIndex) * 2000;
-                string nextPlayer = GetNextPlayer(currentPlayer, moveIndex, phase);
-                score += (nextPlayer == currentPlayer) ? FIRST_MOVE_BONUS : -FIRST_MOVE_BONUS;
             }
 
             // 3. 移動階段評估
@@ -179,37 +187,88 @@ namespace SeegaGame.Services
                 score += CalculateProximityScore(myPos, opPos);
                 score += (myMobility - opMobility) * 5;
 
-                // 殘局威脅感知
+                // 殘局威脅感知 (封鎖線偵測)
                 if (opPieces <= 4)
                 {
                     foreach (var opP in opPos)
                     {
-                        int[] dr = { -1, 1, 0, 0 };
-                        int[] dc = { 0, 0, -1, 1 };
-
+                        int[] dr = { -1, 1, 0, 0 }; int[] dc = { 0, 0, -1, 1 };
                         for (int i = 0; i < 4; i++)
                         {
                             int r1 = opP.R + dr[i], c1 = opP.C + dc[i];
                             int r2 = opP.R - dr[i], c2 = opP.C - dc[i];
-
                             if (In(r1, c1) && In(r2, c2))
                             {
-                                bool canTrap = (board[r1][c1] == currentPlayer && board[r2][c2] == null) ||
-                                              (board[r1][c1] == null && board[r2][c2] == currentPlayer);
-
-                                if (canTrap) score += 1500;
+                                if ((board[r1][c1] == currentPlayer && board[r2][c2] == null) ||
+                                    (board[r1][c1] == null && board[r2][c2] == currentPlayer))
+                                    score += 1500;
                             }
                         }
                     }
-
-                    // ===== 移除這段！太慢了！ =====
-                    // var opValidMoves = _gs.GetValidMoves(board, opponent, GamePhase.MOVEMENT, null, null);
-                    // if (opValidMoves.Count == 0) score -= 8000;
                 }
             }
 
             score += (myPieces - opPieces) * MAT;
             return score;
+        }
+
+        private int GetOpeningKillScore(string?[][] b, string me, string op, bool iMoveFirst)
+        {
+            int bonus = 0;
+            int[] dr = { -1, 1, 0, 0 }, dc = { 0, 0, -1, 1 };
+
+            for (int i = 0; i < 4; i++)
+            {
+                int adjR = 2 + dr[i], adjC = 2 + dc[i];         // 中心點周圍 (C2, C4, B3, D3)
+                int farR = 2 + dr[i] * 2, farC = 2 + dc[i] * 2; // 對面位置 (C1, C5, A3, E3)
+
+                if (In(adjR, adjC) && In(farR, farC))
+                {
+                    // A. 我方發動開局殺的條件：
+                    // 中心對面是我，中心旁邊是敵，且我擁有第 25 手移動權
+                    if (b[farR][farC] == me && b[adjR][adjC] == op)
+                    {
+                        if (iMoveFirst && HasNearbyPiece(b, 2, 2, me)) bonus += 5000; // 高額獎勵進攻
+                        else bonus += 500; // 即使沒先手，這也是好的防禦佈陣
+                    }
+
+                    // B. 我方會被開局殺的條件 (重罰)：
+                    // 中心旁邊是我，中心對面是敵，且敵方擁有第 25 手移動權
+                    if (b[farR][farC] == op && b[adjR][adjC] == me)
+                    {
+                        if (!iMoveFirst) bonus -= 8000; // 極重罰，這是必死位
+                        else bonus -= 1000; // 即使我有先手，這位置也太危險
+                    }
+                }
+            }
+            return bonus;
+        }
+        private bool IsVulnerableToOpeningKill(string?[][] b, int r, int c, string me)
+        {
+            // 只檢查中心周圍的四個關鍵位置
+            if (Math.Abs(r - 2) + Math.Abs(c - 2) != 1) return false;
+
+            string op = _gs.GetOpponent(me);
+            // 找出中心對稱點 (如果我在 C2，對稱點就是 C4)
+            int oppR = 2 + (2 - r);
+            int oppC = 2 + (2 - c);
+
+            // 如果對稱點已經有敵方棋子，那這一步就是送死
+            if (In(oppR, oppC) && b[oppR][oppC] == op) return true;
+
+            return false;
+        }
+
+        // 檢查周圍是否有棋子可以跳入指定位置
+        private bool HasNearbyPiece(string?[][] b, int r, int c, string me)
+        {
+            int[] dr = { -1, 1, 0, 0 }, dc = { 0, 0, -1, 1 };
+            for (int i = 0; i < 4; i++)
+            {
+                int nr = r + dr[i], nc = c + dc[i];
+                if (In(nr, nc) && b[nr][nc] == me) return true;
+            }
+            return false;
         }
 
         private bool IsNextToEnemy(string?[][] board, int r, int c, string opponent)
