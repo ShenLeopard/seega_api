@@ -11,9 +11,13 @@ namespace SeegaGame.Services
 
         private Move? RootSearch(GameTTContext ctx, AiMoveRequest req, long h, int d, List<Move> moves)
         {
+            _sw.Restart();
+            _debugNodes = 0;
             Move? bestM = null;
             int bestScore = -WIN * 2;
             int alpha = -WIN * 2;
+
+            if (!moves.Any()) return null;
 
             ProbeTT(ctx, h, 0, -2000000, 2000000, out _, out Move? ttMove);
 
@@ -27,6 +31,8 @@ namespace SeegaGame.Services
             {
                 var ud = _gs.MakeMove(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex);
                 var state = GetNextState(h, m, req.CurrentPlayer, req.Phase, req.MoveIndex, ud);
+
+                // 定義下一次搜尋的 lastMove
                 Move? nX = (req.CurrentPlayer == "X") ? m : req.LastMoveX;
                 Move? nO = (req.CurrentPlayer == "O") ? m : req.LastMoveO;
 
@@ -38,10 +44,13 @@ namespace SeegaGame.Services
 
                 _gs.UnmakeMove(req.Board, ud, req.CurrentPlayer);
 
-                if (score > bestScore) { bestScore = score; bestM = m; }
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestM = m;
+                }
                 alpha = Math.Max(alpha, bestScore);
 
-                // 絕殺截斷：既然能贏，就不再搜尋其他分支
                 if (bestScore >= WIN) break;
             }
 

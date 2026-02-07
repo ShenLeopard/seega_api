@@ -52,30 +52,33 @@ namespace SeegaGame.Services
             int score = 0;
             string op = player == "X" ? "O" : "X";
 
-            // 1. 吃子預判 (最高權重)
+            // 1. 吃子預判
             if (IsCaptureMove(board, m, player)) score += 10000;
 
-            // 2. 自殺預判 (核心修正)
-            // 模擬移動後，檢查該位置是否立即面臨危險
+            // 2. 自殺預判 (僅在移動階段執行)
             if (IsSuicideMove(board, m, player, op)) score -= 8000;
 
-            // 3. 距離誘導 (保持前進動力)
+            // 3. 距離誘導
             score += (10 - (Math.Abs(m.To.R - 2) + Math.Abs(m.To.C - 2)));
 
             return score;
         }
         private bool IsSuicideMove(string?[][] board, Move m, string player, string op)
         {
+            // 佈陣階段沒有 From 座標，直接跳過檢查
+            if (m.From == null) return false;
+
             // 暫時模擬移動
-            string? originFrom = board[m.From!.R][m.From.C];
+            string? originFrom = board[m.From.R][m.From.C];
             string? originTo = board[m.To.R][m.To.C];
 
             board[m.From.R][m.From.C] = null;
             board[m.To.R][m.To.C] = player;
 
+            // 檢查移動後的新位置是否會被夾擊
             bool risk = IsPieceAtRisk(board, m.To.R, m.To.C, player, op);
 
-            // 還原
+            // 還原棋盤
             board[m.From.R][m.From.C] = originFrom;
             board[m.To.R][m.To.C] = originTo;
 
@@ -167,12 +170,8 @@ namespace SeegaGame.Services
                         {
                             myMobility += CountAdjacentEmpty(board, r, c);
                             if (IsNextToEnemy(board, r, c, opponent)) score += CONTACT_BONUS;
-
-                            // --- 核心修正：危機偵測 (防止送頭) ---
                             if (IsPieceAtRisk(board, r, c, currentPlayer, opponent))
-                            {
-                                vulnerabilityPenalty -= (MAT * 3 / 4); // 如果這顆子快被吃了，大幅扣分
-                            }
+                                vulnerabilityPenalty -= (MAT * 3 / 4);
                         }
                     }
                     else
