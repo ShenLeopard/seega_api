@@ -52,36 +52,27 @@ namespace SeegaGame.Services
             int score = 0;
             string op = player == "X" ? "O" : "X";
 
-            // 1. 吃子預判
-            if (IsCaptureMove(board, m, player)) score += 10000;
+            if (IsCaptureMove(board, m, player)) score += 15000; // 提高吃子權重
 
-            // 2. 自殺預判 (僅在移動階段執行)
-            if (IsSuicideMove(board, m, player, op)) score -= 8000;
+            if (m.From != null) // MOVEMENT 階段
+            {
+                // 自殺步檢查：扣分必須大於吃子得分，防止無腦換子
+                if (IsSuicideMove(board, m, player, op)) score -= 20000;
+            }
 
-            // 3. 距離誘導
             score += (10 - (Math.Abs(m.To.R - 2) + Math.Abs(m.To.C - 2)));
-
             return score;
         }
         private bool IsSuicideMove(string?[][] board, Move m, string player, string op)
         {
-            // 佈陣階段沒有 From 座標，直接跳過檢查
             if (m.From == null) return false;
-
-            // 暫時模擬移動
             string? originFrom = board[m.From.R][m.From.C];
             string? originTo = board[m.To.R][m.To.C];
-
             board[m.From.R][m.From.C] = null;
             board[m.To.R][m.To.C] = player;
-
-            // 檢查移動後的新位置是否會被夾擊
             bool risk = IsPieceAtRisk(board, m.To.R, m.To.C, player, op);
-
-            // 還原棋盤
             board[m.From.R][m.From.C] = originFrom;
             board[m.To.R][m.To.C] = originTo;
-
             return risk;
         }
 
@@ -128,19 +119,20 @@ namespace SeegaGame.Services
             }
             return 0;
         }
+        // 【修正版】評估函式：加入對等危機意識
         private int EvaluatePosition(string?[][] board, string currentPlayer, GamePhase phase, int moveIndex)
         {
             int score = 0;
             int myPieces = 0, opPieces = 0;
             int myMobility = 0, opMobility = 0;
-            int vulnerabilityPenalty = 0;
+            int dangerScore = 0;
 
             int[] myQuadrants = new int[4];
             List<Position> myPos = new();
             List<Position> opPos = new();
 
             string opponent = _gs.GetOpponent(currentPlayer);
-            bool iAmAttacker = IsAttacker(currentPlayer, currentPlayer, moveIndex);
+            bool currentIsAttacker = IsAttacker(currentPlayer, currentPlayer, moveIndex);
 
             for (int r = 0; r < 5; r++)
             {
@@ -156,49 +148,45 @@ namespace SeegaGame.Services
                         int q = (r <= 2 ? 0 : 2) + (c <= 2 ? 0 : 1);
                         myQuadrants[q]++;
 
-                        if (r == 2 && c == 2 && phase == GamePhase.MOVEMENT) score += CEN;
-
-                        if (phase == GamePhase.PLACEMENT)
-                        {
-                            int neighbors = CountAdjacentFriendly(board, r, c, currentPlayer);
-                            score += Math.Min(neighbors, 2) * 60;
-                            int v = CalculateVulnerability(board, r, c, opponent);
-                            score -= iAmAttacker ? v * 100 : v * 700;
-                        }
-
                         if (phase == GamePhase.MOVEMENT)
                         {
                             myMobility += CountAdjacentEmpty(board, r, c);
                             if (IsNextToEnemy(board, r, c, opponent)) score += CONTACT_BONUS;
+                            // 我方危機偵測 (防自殺)
                             if (IsPieceAtRisk(board, r, c, currentPlayer, opponent))
-                                vulnerabilityPenalty -= (MAT * 3 / 4);
+                                dangerScore -= (MAT * 4 / 5);
+                        }
+                        else if (phase == GamePhase.PLACEMENT)
+                        {
+                            int v = CalculateVulnerability(board, r, c, opponent);
+                            // 防守方(先手)要極度小心佈陣，進攻方(後手)則可以稍激進
+                            score -= currentIsAttacker ? v * 150 : v * 800;
                         }
                     }
-                    else
+                    else // 敵方
                     {
                         opPieces++;
                         opPos.Add(new Position { R = r, C = c });
-                        if (phase == GamePhase.MOVEMENT) opMobility += CountAdjacentEmpty(board, r, c);
+                        if (phase == GamePhase.MOVEMENT)
+                        {
+                            opMobility += CountAdjacentEmpty(board, r, c);
+                            // 敵方危機偵測 (增加攻擊直覺)
+                            if (IsPieceAtRisk(board, r, c, opponent, currentPlayer))
+                                dangerScore += (MAT * 3 / 4);
+                        }
                     }
                 }
             }
 
             if (phase == GamePhase.MOVEMENT)
             {
-                int occupiedQuadrants = 0;
-                foreach (int count in myQuadrants) if (count > 0) occupiedQuadrants++;
-                score += occupiedQuadrants * 400;
-                foreach (int count in myQuadrants) if (count > 5) score -= (count - 5) * 500;
-            }
+                // 空間平衡：鼓勵分散，懲罰擁擠
+                int occupied = 0;
+                foreach (int count in myQuadrants) if (count > 0) occupied++;
+                score += occupied * 400;
+                foreach (int count in myQuadrants) if (count > 5) score -= (count - 5) * 600;
 
-            if (phase == GamePhase.PLACEMENT)
-            {
-                bool iMoveFirst = (moveIndex % 4 == 0 || moveIndex % 4 == 3);
-                score += GetOpeningKillScore(board, currentPlayer, opponent, iMoveFirst);
-                score += GetPotentialCaptureScore(board, currentPlayer, opponent, phase, moveIndex) * 2000;
-            }
-            else if (phase == GamePhase.MOVEMENT && myPos.Count > 0 && opPos.Count > 0)
-            {
+                // 殘局收割邏輯
                 if (opPieces <= 3)
                 {
                     score += CalculateProximityScore(myPos, opPos) * 3;
@@ -210,28 +198,26 @@ namespace SeegaGame.Services
                     score += (myMobility - opMobility) * 5;
                 }
             }
+            else if (phase == GamePhase.PLACEMENT)
+            {
+                // 誰是後手誰就擁有第 25 手的 Opening Kill 機會
+                score += GetOpeningKillScore(board, currentPlayer, opponent, currentIsAttacker);
+            }
 
-            score += vulnerabilityPenalty;
+            score += dangerScore;
             score += (myPieces - opPieces) * MAT;
             return score;
         }
         private bool IsPieceAtRisk(string?[][] b, int r, int c, string me, string op)
         {
-            // 檢查水平與垂直方向
-            // 方向對：(r-1, c) 與 (r+1, c) | (r, c-1) 與 (r, c+1)
-            int[] dr = { 1, 0 };
-            int[] dc = { 0, 1 };
-
+            int[] dr = { 1, 0 }; int[] dc = { 0, 1 };
             for (int i = 0; i < 2; i++)
             {
                 int r1 = r + dr[i], c1 = c + dc[i];
                 int r2 = r - dr[i], c2 = c - dc[i];
-
                 if (In(r1, c1) && In(r2, c2))
                 {
-                    // 情況 1: [敵人] - [我] - [空格] 且對手能跳入空格
                     if (b[r1][c1] == op && b[r2][c2] == null && CanPlayerReach(b, op, r2, c2)) return true;
-                    // 情況 2: [空格] - [我] - [敵人] 且對手能跳入空格
                     if (b[r1][c1] == null && b[r2][c2] == op && CanPlayerReach(b, op, r1, c1)) return true;
                 }
             }
@@ -240,8 +226,7 @@ namespace SeegaGame.Services
         // 【新增】快速判定對手是否能移動到某個空格
         private bool CanPlayerReach(string?[][] b, string player, int tr, int tc)
         {
-            int[] dr = { -1, 1, 0, 0 };
-            int[] dc = { 0, 0, -1, 1 };
+            int[] dr = { -1, 1, 0, 0 }; int[] dc = { 0, 0, -1, 1 };
             for (int i = 0; i < 4; i++)
             {
                 int nr = tr + dr[i], nc = tc + dc[i];

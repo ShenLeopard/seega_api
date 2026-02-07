@@ -23,15 +23,18 @@ namespace SeegaGame.Services
 
         private string InferFirstPlayer(string currentPlayer, int moveIndex)
         {
-            if (moveIndex <= 0) return "X";
-            bool isFirstPlayerMove = (moveIndex <= 4) ? (moveIndex <= 2) : (moveIndex % 2 == 1);
-            return isFirstPlayerMove ? currentPlayer : _gs.GetOpponent(currentPlayer);
+            if (moveIndex <= 0) return "X"; // 預設
+            // 2+2 週期是 4。 (moveIndex-1) % 4 等於 0 或 1 是先手，2 或 3 是後手
+            int offset = (moveIndex - 1) % 4;
+            bool currentIsFirst = (offset == 0 || offset == 1);
+            return currentIsFirst ? currentPlayer : _gs.GetOpponent(currentPlayer);
         }
 
         private bool IsAttacker(string player, string currentPlayer, int moveIndex)
         {
             string firstPlayer = InferFirstPlayer(currentPlayer, moveIndex);
-            return player == _gs.GetOpponent(firstPlayer);
+            string secondPlayer = _gs.GetOpponent(firstPlayer);
+            return player == secondPlayer;
         }
 
         private bool IsComboMove(int moveIndex, GamePhase phase)

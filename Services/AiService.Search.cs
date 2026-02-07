@@ -84,8 +84,8 @@ namespace SeegaGame.Services
         }
 
         private int AlphaBeta(GameTTContext ctx, string?[][] board, long h, int d,
-             int alpha, int beta, string curr, Move? lX, Move? lO,
-             GamePhase ph, int idx)
+                     int alpha, int beta, string curr, Move? lX, Move? lO,
+                     GamePhase ph, int idx)
         {
             if (ProbeTT(ctx, h, d, alpha, beta, out int ttScore, out Move? ttMove)) return ttScore;
 
@@ -101,7 +101,6 @@ namespace SeegaGame.Services
                 return EvaluatePosition(board, curr, ph, idx) + STUCK_ADVANTAGE;
             }
 
-            // 每一層都進行排序，且現在包含自殺步預判
             var ordered = moves.OrderByDescending(m =>
             {
                 if (ttMove != null && IsSameMove(m, ttMove)) return 2000000;
@@ -119,17 +118,18 @@ namespace SeegaGame.Services
 
                 int score;
                 if (state.isSamePlayer)
-                    score = AlphaBeta(ctx, board, state.nextHash, d - 1, alpha, beta, curr, nX, nO, state.nextPhase, idx + 1);
+                    // 重要：連動攻擊不減深度，確保 AI 算到底
+                    score = AlphaBeta(ctx, board, state.nextHash, d, alpha, beta, curr, nX, nO, state.nextPhase, idx + 1);
                 else
                     score = -AlphaBeta(ctx, board, state.nextHash, d - 1, -beta, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1);
 
-                // 跳恰恰修正：非吃子步微量懲罰，鼓勵進攻
+                // 跳恰恰修正
                 if (ph == GamePhase.MOVEMENT && ud.Captured.Count == 0) score -= 10;
 
                 _gs.UnmakeMove(board, ud, curr);
 
                 if (score > bestS) { bestS = score; bestM = m; }
-                alpha = Math.Max(alpha, score);
+                alpha = Math.Max(alpha, bestS);
                 if (alpha >= beta) break;
             }
 
