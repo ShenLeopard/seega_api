@@ -11,9 +11,8 @@ namespace SeegaGame.Services
         // CONTACT_BONUS: 貼著敵人加幾分
         private const int CONTACT_BONUS = 30;
         private int GetMoveOrderingScore(string?[][] board, Move m, string player,
-                                        GamePhase phase, int moveIndex, Move? lastX, Move? lastO)
+                                GamePhase phase, int moveIndex, Move? lastX, Move? lastO)
         {
-            // 如果是佈陣階段，優先佔領靠近中心的格子
             if (phase == GamePhase.PLACEMENT)
             {
                 int rDist = Math.Abs(m.To.R - 2);
@@ -21,22 +20,93 @@ namespace SeegaGame.Services
                 return 100 - (rDist + cDist) * 10;
             }
 
-            // 如果是移動階段，看吃子與窒息潛力
             if (phase == GamePhase.MOVEMENT)
             {
-                var ud = _gs.MakeMove(board, m, player, phase, moveIndex);
+                // --- 修正：禁止在排序中呼叫 GetValidMoves ---
                 int score = 0;
+                int[] dr = { -1, 1, 0, 0 }, dc = { 0, 0, -1, 1 };
+                string op = player == "X" ? "O" : "X";
 
-                // 立即吃子權重最高
-                score += ud.Captured.Count * 2000;
+                // 1. 立即吃子判定 (預判，不需 MakeMove)
+                for (int i = 0; i < 4; i++)
+                {
+                    int r1 = m.To.R + dr[i], c1 = m.To.C + dc[i];
+                    int r2 = m.To.R + dr[i] * 2, c2 = m.To.C + dc[i] * 2;
+                    if (In(r2, c2) && board[r1][c1] == op && board[r2][c2] == player)
+                        score += 10000;
+                }
 
-                // 預判是否將對手鎖死 (Stuck)
+                // 2. 禁止回頭路判定 (如果上一手就是從 To 走過來的，直接排到最後)
+                Move? myL = (player == "X") ? lastX : lastO;
+                if (myL != null && myL.From != null &&
+                    m.To.R == myL.From.R && m.To.C == myL.From.C) score -= 5000;
+
+                return score;
+            }
+            return 0;
+        }
+        // 【新增】輕量級排序：專供 AlphaBeta 遞迴內部使用
+        // 絕對禁止在此呼叫 MakeMove 或 GetValidMoves，只做 O(1) 的座標運算
+        private int GetFastMoveOrderingScore(string?[][] board, Move m, string player)
+        {
+            int score = 0;
+            string op = player == "X" ? "O" : "X";
+            int[] dr = { -1, 1, 0, 0 }, dc = { 0, 0, -1, 1 };
+
+            // 1. 快速預判吃子 (Capture Heuristic)
+            for (int i = 0; i < 4; i++)
+            {
+                int r1 = m.To.R + dr[i], c1 = m.To.C + dc[i];
+                int r2 = m.To.R + dr[i] * 2, c2 = m.To.C + dc[i] * 2;
+
+                // 只要能吃子，分數加爆，確保先搜這步
+                if (In(r2, c2) && board[r1][c1] == op && board[r2][c2] == player)
+                    score += 10000;
+            }
+
+            // 2. 距離引導 (可選)：在沒吃子的情況下，稍微傾向靠近中心或敵人，避免在外圍發呆
+            // 這裡只給很小的權重，以免干擾吃子判斷
+            score += (10 - (Math.Abs(m.To.R - 2) + Math.Abs(m.To.C - 2)));
+
+            return score;
+        }
+
+        // 【重新命名】重型排序：只在 RootSearch (第一層) 使用
+        // 這裡保留你原本的邏輯：包含吃子模擬 + 檢查對手是否窒息 (Stuck/Suffocate)
+        private int GetHeavyMoveOrderingScore(string?[][] board, Move m, string player,
+                                GamePhase phase, int moveIndex, Move? lastX, Move? lastO)
+        {
+            if (phase == GamePhase.PLACEMENT)
+            {
+                int rDist = Math.Abs(m.To.R - 2);
+                int cDist = Math.Abs(m.To.C - 2);
+                return 100 - (rDist + cDist) * 10;
+            }
+
+            if (phase == GamePhase.MOVEMENT)
+            {
+                // 根節點只執行幾十次，這裡做 MakeMove 是安全的
+                var ud = _gs.MakeMove(board, m, player, phase, moveIndex);
+                int score = ud.Captured.Count * 2000;
+
                 string op = _gs.GetOpponent(player);
                 Move? nX = (player == "X") ? m : lastX;
                 Move? nO = (player == "O") ? m : lastO;
 
+                // 檢查這步棋是否讓對手無路可走 (窒息戰術)
                 var opMoves = _gs.GetValidMoves(board, op, GamePhase.MOVEMENT, nX, nO);
-                if (opMoves.Count == 0) score += 3000; // SUFFOCATE_BONUS
+
+                if (opMoves.Count == 0)
+                {
+                    int opCount = 0;
+                    for (int r = 0; r < 5; r++)
+                        for (int c = 0; c < 5; c++)
+                            if (board[r][c] == op) opCount++;
+
+                    // 如果對手剩很少子，讓他無路可走是壞事 (因為要拔子)；否則是大好事
+                    if (opCount <= 4) score -= 5000;
+                    else score += 3000;
+                }
 
                 _gs.UnmakeMove(board, ud, player);
                 return score;
@@ -50,7 +120,6 @@ namespace SeegaGame.Services
             int myPieces = 0, opPieces = 0;
             int myMobility = 0, opMobility = 0;
 
-            // 用於計算引力 (Proximity)
             List<Position> myPos = new();
             List<Position> opPos = new();
 
@@ -72,26 +141,22 @@ namespace SeegaGame.Services
 
                         if (r == 2 && c == 2) score += CEN;
 
-                        // --- 修正 A: 只有佈陣階段才重罰脆弱性 ---
-                        // 移動階段交給 AlphaBeta 搜尋去判斷死活，靜態評估不要過度恐嚇
                         if (phase == GamePhase.PLACEMENT)
                         {
                             int neighbors = CountAdjacentFriendly(board, r, c, currentPlayer);
-                            score += Math.Min(neighbors, 2) * 60; // 限制相連加分
+                            score += Math.Min(neighbors, 2) * 60;
 
                             int v = CalculateVulnerability(board, r, c, opponent);
-                            score -= iAmAttacker ? v * 100 : v * 700; // 佈陣時依然要小心
+                            score -= iAmAttacker ? v * 100 : v * 700;
                         }
 
-                        // --- 修正 B: 移動階段獎勵「貼身肉搏」 ---
                         if (phase == GamePhase.MOVEMENT)
                         {
                             myMobility += CountAdjacentEmpty(board, r, c);
-                            // 如果貼著敵人，給予獎勵 (施壓)
                             if (IsNextToEnemy(board, r, c, opponent)) score += CONTACT_BONUS;
                         }
                     }
-                    else // 對手
+                    else
                     {
                         opPieces++;
                         opPos.Add(new Position { R = r, C = c });
@@ -108,13 +173,39 @@ namespace SeegaGame.Services
                 score += (nextPlayer == currentPlayer) ? FIRST_MOVE_BONUS : -FIRST_MOVE_BONUS;
             }
 
-            // --- 修正 C: 加入「敵我距離引力」 (Proximity Gravity) ---
+            // 3. 移動階段評估
             if (phase == GamePhase.MOVEMENT && myPos.Count > 0 && opPos.Count > 0)
             {
                 score += CalculateProximityScore(myPos, opPos);
-
-                // 機動性權重降低 (從 8 降到 5)，避免為了步數而不敢進攻
                 score += (myMobility - opMobility) * 5;
+
+                // 殘局威脅感知
+                if (opPieces <= 4)
+                {
+                    foreach (var opP in opPos)
+                    {
+                        int[] dr = { -1, 1, 0, 0 };
+                        int[] dc = { 0, 0, -1, 1 };
+
+                        for (int i = 0; i < 4; i++)
+                        {
+                            int r1 = opP.R + dr[i], c1 = opP.C + dc[i];
+                            int r2 = opP.R - dr[i], c2 = opP.C - dc[i];
+
+                            if (In(r1, c1) && In(r2, c2))
+                            {
+                                bool canTrap = (board[r1][c1] == currentPlayer && board[r2][c2] == null) ||
+                                              (board[r1][c1] == null && board[r2][c2] == currentPlayer);
+
+                                if (canTrap) score += 1500;
+                            }
+                        }
+                    }
+
+                    // ===== 移除這段！太慢了！ =====
+                    // var opValidMoves = _gs.GetValidMoves(board, opponent, GamePhase.MOVEMENT, null, null);
+                    // if (opValidMoves.Count == 0) score -= 8000;
+                }
             }
 
             score += (myPieces - opPieces) * MAT;

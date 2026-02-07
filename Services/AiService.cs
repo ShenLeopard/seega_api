@@ -63,9 +63,8 @@ namespace SeegaGame.Services
             req.LastMoveO = ValidateLastMove(req.Board, req.LastMoveO, "O");
 
             var ctx = GetContext(req.GameUUId);
-            long h = InitialHash(req.Board, req.CurrentPlayer);  // 移除 req.Phase 參數
+            long h = InitialHash(req.Board, req.CurrentPlayer);
 
-            // 1. 處理受困移除模式
             if (req.Phase == GamePhase.STUCK_REMOVAL)
             {
                 return _gs.GetValidMoves(req.Board, req.CurrentPlayer, req.Phase, null, null)
@@ -73,31 +72,58 @@ namespace SeegaGame.Services
                     .FirstOrDefault();
             }
 
-            // 2. 取得合法步
             var moves = _gs.GetValidMoves(req.Board, req.CurrentPlayer, req.Phase, req.LastMoveX, req.LastMoveO);
             if (!moves.Any()) return null;
 
-            // 3. 絕殺偵測：如果在移動階段能一步獲勝，直接回傳
-            if (req.Phase == GamePhase.MOVEMENT)
-            {
-                foreach (var m in moves)
+            // 計算子力
+            int myCount = 0, opCount = 0;
+            for (int r = 0; r < 5; r++)
+                for (int c = 0; c < 5; c++)
                 {
-                    var ud = _gs.MakeMove(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex);
-                    if (_gs.CheckWinner(req.Board) == req.CurrentPlayer)
-                    {
-                        _gs.UnmakeMove(req.Board, ud, req.CurrentPlayer);
-                        return m;
-                    }
-                    _gs.UnmakeMove(req.Board, ud, req.CurrentPlayer);
+                    if (req.Board[r][c] == req.CurrentPlayer) myCount++;
+                    else if (req.Board[r][c] != null) opCount++;
+                }
+
+            // 計算深度
+            int d = req.Difficulty;
+
+            if (req.Phase == GamePhase.PLACEMENT)
+            {
+                if (req.MoveIndex == 24)
+                    d = Math.Max(req.Difficulty, 6);
+                else
+                    d = (req.MoveIndex >= 18) ? Math.Min(7, (24 - req.MoveIndex) + 2) : 3;
+            }
+            else if (req.Phase == GamePhase.MOVEMENT)
+            {
+                int diff = myCount - opCount;
+
+                // ===== 修正：統一使用深度 2（快速且有效） =====
+
+                // 對手 2-6 顆：深度 2（配合 Quiesce 和 Move Ordering 足夠找到好棋）
+                if (opCount >= 2 && opCount <= 6)
+                {
+                    d = 4; // 4 層才能完整看清「誘敵 -> 對手動 -> 我吃子」的過程
+                }
+                // 對手 7-8 顆且領先 4 顆以上
+                else if (opCount <= 8 && diff >= 4)
+                {
+                    d = 3;
+                }
+                // 對手只剩 1 顆或領先 10 顆以上
+                else if (opCount == 1 || diff >= 10)
+                {
+                    d = 1;
+                }
+                // 均勢或劣勢
+                else
+                {
+                    d = req.Difficulty;
                 }
             }
 
-            // 4. 計算深度並開始搜尋 (包含第 24 手的深度優化)
-            int d = CalculateSearchDepth(req);
-
             return RootSearch(ctx, req, h, d, moves);
         }
-
         // ===== 輔助方法 =====
         protected bool In(int r, int c) => r >= 0 && r < 5 && c >= 0 && c < 5;
 
