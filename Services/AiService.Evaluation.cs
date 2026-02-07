@@ -51,24 +51,35 @@ namespace SeegaGame.Services
         {
             int score = 0;
             string op = player == "X" ? "O" : "X";
-            int[] dr = { -1, 1, 0, 0 }, dc = { 0, 0, -1, 1 };
 
-            // 1. 快速預判吃子 (Capture Heuristic)
-            for (int i = 0; i < 4; i++)
-            {
-                int r1 = m.To.R + dr[i], c1 = m.To.C + dc[i];
-                int r2 = m.To.R + dr[i] * 2, c2 = m.To.C + dc[i] * 2;
+            // 1. 吃子預判 (最高權重)
+            if (IsCaptureMove(board, m, player)) score += 10000;
 
-                // 只要能吃子，分數加爆，確保先搜這步
-                if (In(r2, c2) && board[r1][c1] == op && board[r2][c2] == player)
-                    score += 10000;
-            }
+            // 2. 自殺預判 (核心修正)
+            // 模擬移動後，檢查該位置是否立即面臨危險
+            if (IsSuicideMove(board, m, player, op)) score -= 8000;
 
-            // 2. 距離引導 (可選)：在沒吃子的情況下，稍微傾向靠近中心或敵人，避免在外圍發呆
-            // 這裡只給很小的權重，以免干擾吃子判斷
+            // 3. 距離誘導 (保持前進動力)
             score += (10 - (Math.Abs(m.To.R - 2) + Math.Abs(m.To.C - 2)));
 
             return score;
+        }
+        private bool IsSuicideMove(string?[][] board, Move m, string player, string op)
+        {
+            // 暫時模擬移動
+            string? originFrom = board[m.From!.R][m.From.C];
+            string? originTo = board[m.To.R][m.To.C];
+
+            board[m.From.R][m.From.C] = null;
+            board[m.To.R][m.To.C] = player;
+
+            bool risk = IsPieceAtRisk(board, m.To.R, m.To.C, player, op);
+
+            // 還原
+            board[m.From.R][m.From.C] = originFrom;
+            board[m.To.R][m.To.C] = originTo;
+
+            return risk;
         }
 
         // 【重新命名】重型排序：只在 RootSearch (第一層) 使用
@@ -119,16 +130,15 @@ namespace SeegaGame.Services
             int score = 0;
             int myPieces = 0, opPieces = 0;
             int myMobility = 0, opMobility = 0;
+            int vulnerabilityPenalty = 0;
 
-            // 空間分佈統計
-            int[] myQuadrants = new int[4]; // 0:左上, 1:右上, 2:左下, 3:右下
+            int[] myQuadrants = new int[4];
             List<Position> myPos = new();
             List<Position> opPos = new();
 
             string opponent = _gs.GetOpponent(currentPlayer);
             bool iAmAttacker = IsAttacker(currentPlayer, currentPlayer, moveIndex);
 
-            // 1. 單次掃描盤面 (效能優化)
             for (int r = 0; r < 5; r++)
             {
                 for (int c = 0; c < 5; c++)
@@ -140,8 +150,6 @@ namespace SeegaGame.Services
                     {
                         myPieces++;
                         myPos.Add(new Position { R = r, C = c });
-
-                        // 空間象限判定 (r:0-4, c:0-4)
                         int q = (r <= 2 ? 0 : 2) + (c <= 2 ? 0 : 1);
                         myQuadrants[q]++;
 
@@ -159,6 +167,12 @@ namespace SeegaGame.Services
                         {
                             myMobility += CountAdjacentEmpty(board, r, c);
                             if (IsNextToEnemy(board, r, c, opponent)) score += CONTACT_BONUS;
+
+                            // --- 核心修正：危機偵測 (防止送頭) ---
+                            if (IsPieceAtRisk(board, r, c, currentPlayer, opponent))
+                            {
+                                vulnerabilityPenalty -= (MAT * 3 / 4); // 如果這顆子快被吃了，大幅扣分
+                            }
                         }
                     }
                     else
@@ -170,19 +184,14 @@ namespace SeegaGame.Services
                 }
             }
 
-            // 2. 空間平衡邏輯 (防止擠在同一側)
             if (phase == GamePhase.MOVEMENT)
             {
-                // 分散加分：佔據越多象限，分數越高
                 int occupiedQuadrants = 0;
                 foreach (int count in myQuadrants) if (count > 0) occupiedQuadrants++;
                 score += occupiedQuadrants * 400;
-
-                // 擁擠懲罰：單一象限超過 5 顆子時給予重罰，迫使棋子向外擴張
                 foreach (int count in myQuadrants) if (count > 5) score -= (count - 5) * 500;
             }
 
-            // 3. 特殊階段與殘局邏輯
             if (phase == GamePhase.PLACEMENT)
             {
                 bool iMoveFirst = (moveIndex % 4 == 0 || moveIndex % 4 == 3);
@@ -191,11 +200,10 @@ namespace SeegaGame.Services
             }
             else if (phase == GamePhase.MOVEMENT && myPos.Count > 0 && opPos.Count > 0)
             {
-                // 殘局「收割模式」：對手剩 3 子以下時，全力縮小包圍網
                 if (opPieces <= 3)
                 {
-                    score += CalculateProximityScore(myPos, opPos) * 3; // 強化引力
-                    score += (myMobility - opMobility) * 2; // 弱化機動性，不在乎自己能不能動，只要能貼上去
+                    score += CalculateProximityScore(myPos, opPos) * 3;
+                    score += (myMobility - opMobility) * 2;
                 }
                 else
                 {
@@ -204,8 +212,43 @@ namespace SeegaGame.Services
                 }
             }
 
+            score += vulnerabilityPenalty;
             score += (myPieces - opPieces) * MAT;
             return score;
+        }
+        private bool IsPieceAtRisk(string?[][] b, int r, int c, string me, string op)
+        {
+            // 檢查水平與垂直方向
+            // 方向對：(r-1, c) 與 (r+1, c) | (r, c-1) 與 (r, c+1)
+            int[] dr = { 1, 0 };
+            int[] dc = { 0, 1 };
+
+            for (int i = 0; i < 2; i++)
+            {
+                int r1 = r + dr[i], c1 = c + dc[i];
+                int r2 = r - dr[i], c2 = c - dc[i];
+
+                if (In(r1, c1) && In(r2, c2))
+                {
+                    // 情況 1: [敵人] - [我] - [空格] 且對手能跳入空格
+                    if (b[r1][c1] == op && b[r2][c2] == null && CanPlayerReach(b, op, r2, c2)) return true;
+                    // 情況 2: [空格] - [我] - [敵人] 且對手能跳入空格
+                    if (b[r1][c1] == null && b[r2][c2] == op && CanPlayerReach(b, op, r1, c1)) return true;
+                }
+            }
+            return false;
+        }
+        // 【新增】快速判定對手是否能移動到某個空格
+        private bool CanPlayerReach(string?[][] b, string player, int tr, int tc)
+        {
+            int[] dr = { -1, 1, 0, 0 };
+            int[] dc = { 0, 0, -1, 1 };
+            for (int i = 0; i < 4; i++)
+            {
+                int nr = tr + dr[i], nc = tc + dc[i];
+                if (In(nr, nc) && b[nr][nc] == player) return true;
+            }
+            return false;
         }
         private int GetOpeningKillScore(string?[][] b, string me, string op, bool iMoveFirst)
         {

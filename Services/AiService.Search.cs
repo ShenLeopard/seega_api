@@ -75,13 +75,12 @@ namespace SeegaGame.Services
         }
 
         private int AlphaBeta(GameTTContext ctx, string?[][] board, long h, int d,
-                     int alpha, int beta, string curr, Move? lX, Move? lO,
-                     GamePhase ph, int idx)
+             int alpha, int beta, string curr, Move? lX, Move? lO,
+             GamePhase ph, int idx)
         {
             if (ProbeTT(ctx, h, d, alpha, beta, out int ttScore, out Move? ttMove)) return ttScore;
 
             string? winner = _gs.CheckWinner(board);
-            // 加入深度 d，使 AI 選擇最快獲勝的路徑
             if (winner != null) return (winner == curr) ? (WIN + d) : (-WIN - d);
 
             if (d <= 0) return Quiesce(ctx, board, h, alpha, beta, curr, lX, lO, ph, idx);
@@ -93,6 +92,7 @@ namespace SeegaGame.Services
                 return EvaluatePosition(board, curr, ph, idx) + STUCK_ADVANTAGE;
             }
 
+            // 每一層都進行排序，且現在包含自殺步預判
             var ordered = moves.OrderByDescending(m =>
             {
                 if (ttMove != null && IsSameMove(m, ttMove)) return 2000000;
@@ -114,8 +114,7 @@ namespace SeegaGame.Services
                 else
                     score = -AlphaBeta(ctx, board, state.nextHash, d - 1, -beta, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1);
 
-                // --- 跳恰恰修正 ---
-                // 對於沒有吃子的移動，給予極小的負分，這會驅使 AI 優先執行有進展的動作
+                // 跳恰恰修正：非吃子步微量懲罰，鼓勵進攻
                 if (ph == GamePhase.MOVEMENT && ud.Captured.Count == 0) score -= 10;
 
                 _gs.UnmakeMove(board, ud, curr);
