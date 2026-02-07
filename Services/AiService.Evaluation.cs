@@ -120,13 +120,15 @@ namespace SeegaGame.Services
             int myPieces = 0, opPieces = 0;
             int myMobility = 0, opMobility = 0;
 
+            // 空間分佈統計
+            int[] myQuadrants = new int[4]; // 0:左上, 1:右上, 2:左下, 3:右下
             List<Position> myPos = new();
             List<Position> opPos = new();
 
             string opponent = _gs.GetOpponent(currentPlayer);
             bool iAmAttacker = IsAttacker(currentPlayer, currentPlayer, moveIndex);
 
-            // 1. 盤面掃描
+            // 1. 單次掃描盤面 (效能優化)
             for (int r = 0; r < 5; r++)
             {
                 for (int c = 0; c < 5; c++)
@@ -139,16 +141,16 @@ namespace SeegaGame.Services
                         myPieces++;
                         myPos.Add(new Position { R = r, C = c });
 
-                        // 只有在移動階段中心點才有分數
-                        if (phase == GamePhase.MOVEMENT && r == 2 && c == 2) score += CEN;
+                        // 空間象限判定 (r:0-4, c:0-4)
+                        int q = (r <= 2 ? 0 : 2) + (c <= 2 ? 0 : 1);
+                        myQuadrants[q]++;
+
+                        if (r == 2 && c == 2 && phase == GamePhase.MOVEMENT) score += CEN;
 
                         if (phase == GamePhase.PLACEMENT)
                         {
-                            // 佈陣期：強化相鄰加分，形成防禦鏈
                             int neighbors = CountAdjacentFriendly(board, r, c, currentPlayer);
                             score += Math.Min(neighbors, 2) * 60;
-
-                            // 脆弱性檢查
                             int v = CalculateVulnerability(board, r, c, opponent);
                             score -= iAmAttacker ? v * 100 : v * 700;
                         }
@@ -168,77 +170,57 @@ namespace SeegaGame.Services
                 }
             }
 
-            // 2. 佈陣階段特殊邏輯：開局殺預判
-            if (phase == GamePhase.PLACEMENT)
+            // 2. 空間平衡邏輯 (防止擠在同一側)
+            if (phase == GamePhase.MOVEMENT)
             {
-                // [關鍵] 判斷誰會拿到第 25 手的先攻權
-                // 在 Seega 規則下，放下第 24 子的人擁有第 25 手移動權
-                bool iMoveFirst = (moveIndex % 4 == 0 || moveIndex % 4 == 3); // 簡易判斷，依據 2+2 規則
+                // 分散加分：佔據越多象限，分數越高
+                int occupiedQuadrants = 0;
+                foreach (int count in myQuadrants) if (count > 0) occupiedQuadrants++;
+                score += occupiedQuadrants * 400;
 
-                score += GetOpeningKillScore(board, currentPlayer, opponent, iMoveFirst);
-
-                // 基礎佈陣加分 (原有邏輯)
-                score += GetPotentialCaptureScore(board, currentPlayer, opponent, phase, moveIndex) * 2000;
+                // 擁擠懲罰：單一象限超過 5 顆子時給予重罰，迫使棋子向外擴張
+                foreach (int count in myQuadrants) if (count > 5) score -= (count - 5) * 500;
             }
 
-            // 3. 移動階段評估
-            if (phase == GamePhase.MOVEMENT && myPos.Count > 0 && opPos.Count > 0)
+            // 3. 特殊階段與殘局邏輯
+            if (phase == GamePhase.PLACEMENT)
             {
-                score += CalculateProximityScore(myPos, opPos);
-                score += (myMobility - opMobility) * 5;
-
-                // 殘局威脅感知 (封鎖線偵測)
-                if (opPieces <= 4)
+                bool iMoveFirst = (moveIndex % 4 == 0 || moveIndex % 4 == 3);
+                score += GetOpeningKillScore(board, currentPlayer, opponent, iMoveFirst);
+                score += GetPotentialCaptureScore(board, currentPlayer, opponent, phase, moveIndex) * 2000;
+            }
+            else if (phase == GamePhase.MOVEMENT && myPos.Count > 0 && opPos.Count > 0)
+            {
+                // 殘局「收割模式」：對手剩 3 子以下時，全力縮小包圍網
+                if (opPieces <= 3)
                 {
-                    foreach (var opP in opPos)
-                    {
-                        int[] dr = { -1, 1, 0, 0 }; int[] dc = { 0, 0, -1, 1 };
-                        for (int i = 0; i < 4; i++)
-                        {
-                            int r1 = opP.R + dr[i], c1 = opP.C + dc[i];
-                            int r2 = opP.R - dr[i], c2 = opP.C - dc[i];
-                            if (In(r1, c1) && In(r2, c2))
-                            {
-                                if ((board[r1][c1] == currentPlayer && board[r2][c2] == null) ||
-                                    (board[r1][c1] == null && board[r2][c2] == currentPlayer))
-                                    score += 1500;
-                            }
-                        }
-                    }
+                    score += CalculateProximityScore(myPos, opPos) * 3; // 強化引力
+                    score += (myMobility - opMobility) * 2; // 弱化機動性，不在乎自己能不能動，只要能貼上去
+                }
+                else
+                {
+                    score += CalculateProximityScore(myPos, opPos);
+                    score += (myMobility - opMobility) * 5;
                 }
             }
 
             score += (myPieces - opPieces) * MAT;
             return score;
         }
-
         private int GetOpeningKillScore(string?[][] b, string me, string op, bool iMoveFirst)
         {
             int bonus = 0;
             int[] dr = { -1, 1, 0, 0 }, dc = { 0, 0, -1, 1 };
-
             for (int i = 0; i < 4; i++)
             {
-                int adjR = 2 + dr[i], adjC = 2 + dc[i];         // 中心點周圍 (C2, C4, B3, D3)
-                int farR = 2 + dr[i] * 2, farC = 2 + dc[i] * 2; // 對面位置 (C1, C5, A3, E3)
-
+                int adjR = 2 + dr[i], adjC = 2 + dc[i];
+                int farR = 2 + dr[i] * 2, farC = 2 + dc[i] * 2;
                 if (In(adjR, adjC) && In(farR, farC))
                 {
-                    // A. 我方發動開局殺的條件：
-                    // 中心對面是我，中心旁邊是敵，且我擁有第 25 手移動權
                     if (b[farR][farC] == me && b[adjR][adjC] == op)
-                    {
-                        if (iMoveFirst && HasNearbyPiece(b, 2, 2, me)) bonus += 5000; // 高額獎勵進攻
-                        else bonus += 500; // 即使沒先手，這也是好的防禦佈陣
-                    }
-
-                    // B. 我方會被開局殺的條件 (重罰)：
-                    // 中心旁邊是我，中心對面是敵，且敵方擁有第 25 手移動權
+                        bonus += iMoveFirst ? 5000 : 500;
                     if (b[farR][farC] == op && b[adjR][adjC] == me)
-                    {
-                        if (!iMoveFirst) bonus -= 8000; // 極重罰，這是必死位
-                        else bonus -= 1000; // 即使我有先手，這位置也太危險
-                    }
+                        bonus -= iMoveFirst ? 1000 : 8000;
                 }
             }
             return bonus;
@@ -287,19 +269,14 @@ namespace SeegaGame.Services
         private int CalculateProximityScore(List<Position> myPos, List<Position> opPos)
         {
             int totalProximity = 0;
-
             foreach (var my in myPos)
             {
                 int minDist = 100;
                 foreach (var op in opPos)
                 {
-                    // 曼哈頓距離
                     int dist = Math.Abs(my.R - op.R) + Math.Abs(my.C - op.C);
                     if (dist < minDist) minDist = dist;
                 }
-
-                // 距離越近分越高 (5x5 最大距離是 8)
-                // 每個棋子最高貢獻 PROXIMITY_WEIGHT * 8
                 totalProximity += (10 - minDist) * PROXIMITY_WEIGHT;
             }
             return totalProximity;

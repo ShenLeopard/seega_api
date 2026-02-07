@@ -11,17 +11,12 @@ namespace SeegaGame.Services
 
         private Move? RootSearch(GameTTContext ctx, AiMoveRequest req, long h, int d, List<Move> moves)
         {
-            _sw.Restart();
-            _debugNodes = 0;
             Move? bestM = null;
             int bestScore = -WIN * 2;
             int alpha = -WIN * 2;
 
-            if (!moves.Any()) return null;
-
             ProbeTT(ctx, h, 0, -2000000, 2000000, out _, out Move? ttMove);
 
-            // 使用修正後的重型排序
             var ordered = moves.OrderByDescending(m =>
             {
                 if (ttMove != null && IsSameMove(m, ttMove)) return 2000000;
@@ -32,7 +27,6 @@ namespace SeegaGame.Services
             {
                 var ud = _gs.MakeMove(req.Board, m, req.CurrentPlayer, req.Phase, req.MoveIndex);
                 var state = GetNextState(h, m, req.CurrentPlayer, req.Phase, req.MoveIndex, ud);
-
                 Move? nX = (req.CurrentPlayer == "X") ? m : req.LastMoveX;
                 Move? nO = (req.CurrentPlayer == "O") ? m : req.LastMoveO;
 
@@ -44,13 +38,10 @@ namespace SeegaGame.Services
 
                 _gs.UnmakeMove(req.Board, ud, req.CurrentPlayer);
 
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    bestM = m;
-                }
+                if (score > bestScore) { bestScore = score; bestM = m; }
                 alpha = Math.Max(alpha, bestScore);
 
+                // 絕殺截斷：既然能贏，就不再搜尋其他分支
                 if (bestScore >= WIN) break;
             }
 
@@ -84,22 +75,17 @@ namespace SeegaGame.Services
         }
 
         private int AlphaBeta(GameTTContext ctx, string?[][] board, long h, int d,
-             int alpha, int beta, string curr, Move? lX, Move? lO,
-             GamePhase ph, int idx)
+                     int alpha, int beta, string curr, Move? lX, Move? lO,
+                     GamePhase ph, int idx)
         {
-            _debugNodes++;
-
-            // [致命錯誤修正] 應該先檢查 TT，這沒錯
             if (ProbeTT(ctx, h, d, alpha, beta, out int ttScore, out Move? ttMove)) return ttScore;
 
-            // 檢查勝負
             string? winner = _gs.CheckWinner(board);
+            // 加入深度 d，使 AI 選擇最快獲勝的路徑
             if (winner != null) return (winner == curr) ? (WIN + d) : (-WIN - d);
 
-            // 進入靜態搜尋
             if (d <= 0) return Quiesce(ctx, board, h, alpha, beta, curr, lX, lO, ph, idx);
 
-            // 檢查受困
             var moves = _gs.GetValidMoves(board, curr, ph, lX, lO);
             if (moves.Count == 0)
             {
@@ -107,19 +93,14 @@ namespace SeegaGame.Services
                 return EvaluatePosition(board, curr, ph, idx) + STUCK_ADVANTAGE;
             }
 
-            // 排序 (使用輕量排序)
             var ordered = moves.OrderByDescending(m =>
             {
                 if (ttMove != null && IsSameMove(m, ttMove)) return 2000000;
                 return GetFastMoveOrderingScore(board, m, curr);
             });
 
-            int originalAlpha = alpha;
             int bestS = -WIN * 2;
             Move? bestM = null;
-
-            // [關鍵] 增加一個已搜尋節點數檢查，若第一個分支分數極高，後續可考慮 LMR (Late Move Reduction)
-            // 但為求穩，我們先修復基礎剪枝
 
             foreach (var m in ordered)
             {
@@ -129,64 +110,40 @@ namespace SeegaGame.Services
 
                 int score;
                 if (state.isSamePlayer)
-                    // 換手不換人，alpha/beta 保持不變，深度也不變 (或減1，視規則)
-                    // Seega 連動攻擊通常算同一回合，深度不減，或僅微減
-                    score = AlphaBeta(ctx, board, state.nextHash, d, alpha, beta, curr, nX, nO, state.nextPhase, idx + 1);
+                    score = AlphaBeta(ctx, board, state.nextHash, d - 1, alpha, beta, curr, nX, nO, state.nextPhase, idx + 1);
                 else
-                    // 換人，視角切換，alpha/beta 翻轉
                     score = -AlphaBeta(ctx, board, state.nextHash, d - 1, -beta, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1);
+
+                // --- 跳恰恰修正 ---
+                // 對於沒有吃子的移動，給予極小的負分，這會驅使 AI 優先執行有進展的動作
+                if (ph == GamePhase.MOVEMENT && ud.Captured.Count == 0) score -= 10;
 
                 _gs.UnmakeMove(board, ud, curr);
 
                 if (score > bestS) { bestS = score; bestM = m; }
-
-                // 更新 Alpha
-                if (bestS > alpha) alpha = bestS;
-
-                // [剪枝核心]
-                if (alpha >= beta)
-                {
-                    break; // Beta Cut-off
-                }
+                alpha = Math.Max(alpha, score);
+                if (alpha >= beta) break;
             }
 
-            // 儲存 TT
-            int flag = (bestS <= originalAlpha) ? 1 : (bestS >= beta ? 2 : 0);
-            StoreTT(ctx, h, d, bestS, flag, bestM);
-
+            StoreTT(ctx, h, d, bestS, (bestS <= alpha ? 1 : (bestS >= beta ? 2 : 0)), bestM);
             return bestS;
         }
 
         private int Quiesce(GameTTContext ctx, string?[][] board, long h,
-            int alpha, int beta, string curr,
-            Move? lX, Move? lO, GamePhase ph, int idx)
+                   int alpha, int beta, string curr,
+                   Move? lX, Move? lO, GamePhase ph, int idx)
         {
-            _debugNodes++;
-
-            // 1. 站立評估 (Stand-pat)
             int standPat = EvaluatePosition(board, curr, ph, idx);
             if (standPat >= beta) return beta;
             if (standPat > alpha) alpha = standPat;
 
-            // 2. 取得所有步數 (這裡會回傳所有步，這是效能瓶頸之一)
             var moves = _gs.GetValidMoves(board, curr, ph, lX, lO);
-
-            // ★★★ 關鍵修正：只篩選出「真的能吃子」的步數 ★★★
-            // 使用 Where 過濾，確保不會進入無意義的靜態搜尋深淵
-            var captureMoves = moves
-                .Where(m => IsCaptureMove(board, m, curr))
-                .OrderByDescending(m => GetFastMoveOrderingScore(board, m, curr));
+            var captureMoves = moves.Where(m => IsCaptureMove(board, m, curr))
+                                   .OrderByDescending(m => GetFastMoveOrderingScore(board, m, curr));
 
             foreach (var m in captureMoves)
             {
                 var ud = _gs.MakeMove(board, m, curr, ph, idx);
-                // 雙重檢查：如果 MakeMove 後發現沒吃到子 (極少見)，就還原並跳過
-                if (ud.Captured.Count == 0)
-                {
-                    _gs.UnmakeMove(board, ud, curr);
-                    continue;
-                }
-
                 var state = GetNextState(h, m, curr, ph, idx, ud);
                 Move? nX = (curr == "X") ? m : lX; Move? nO = (curr == "O") ? m : lO;
 
@@ -197,11 +154,9 @@ namespace SeegaGame.Services
                     score = -Quiesce(ctx, board, state.nextHash, -beta, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1);
 
                 _gs.UnmakeMove(board, ud, curr);
-
                 if (score >= beta) return beta;
                 if (score > alpha) alpha = score;
             }
-
             return alpha;
         }
 
@@ -211,57 +166,11 @@ namespace SeegaGame.Services
             string op = player == "X" ? "O" : "X";
             for (int i = 0; i < 4; i++)
             {
+                int r1 = m.To.R + dr[i], c1 = m.To.C + dc[i];
                 int r2 = m.To.R + dr[i] * 2, c2 = m.To.C + dc[i] * 2;
-                // 檢查是否形成夾擊
-                if (In(r2, c2) && board[m.To.R + dr[i]][m.To.C + dc[i]] == op
-                    && board[r2][c2] == player) return true;
+                if (In(r2, c2) && board[r1][c1] == op && board[r2][c2] == player) return true;
             }
             return false;
-        }
-
-     
-
-        private int CalculateSearchDepth(AiMoveRequest req)
-        {
-            // Debug: 顯示計數
-            int myCount = 0;
-            int opCount = 0;
-            if (req.Phase == GamePhase.MOVEMENT)
-            {
-                foreach (var row in req.Board)
-                    foreach (var cell in row)
-                    {
-                        if (cell == req.CurrentPlayer) myCount++;
-                        else if (cell != null) opCount++;
-                    }
-                // Console.WriteLine($"[Counts] Me: {myCount}, Op: {opCount}");
-            }
-
-            if (req.Phase == GamePhase.PLACEMENT)
-            {
-                if (req.MoveIndex == 24) return Math.Max(req.Difficulty, 6);
-                return (req.MoveIndex >= 18) ? Math.Min(7, (24 - req.MoveIndex) + 2) : 3;
-            }
-
-            if (req.Phase == GamePhase.MOVEMENT)
-            {
-                // ★ 修正：這裡一定要是 4，否則看不到誘敵
-                if ((myCount - opCount >= 5) && (opCount <= 4))
-                {
-                    Console.WriteLine("[Strategy] Advantage mode: Depth set to 4");
-                    return 4;
-                }
-            }
-
-            return req.Difficulty;
-        }
-
-        // 輔助顯示
-        private string FormatMove(Move? m)
-        {
-            if (m == null) return "null";
-            string from = m.From == null ? "" : $"{_gs.FormatPos(m.From)}->";
-            return $"{from}{_gs.FormatPos(m.To)}";
         }
     }
 }
