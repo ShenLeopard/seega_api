@@ -56,7 +56,7 @@ namespace SeegaGame.Services
 
         private int CalculateProximityScore(List<Position> myPos, List<Position> opPos, int opPieces)
         {
-            int totalProximity = 0;
+            int total = 0;
             foreach (var my in myPos)
             {
                 int minDist = 100;
@@ -65,25 +65,21 @@ namespace SeegaGame.Services
                     int dist = Math.Abs(my.R - op.R) + Math.Abs(my.C - op.C);
                     if (dist < minDist) minDist = dist;
                 }
-                totalProximity += (10 - minDist) * PROXIMITY_WEIGHT;
+                total += (10 - minDist) * PROXIMITY_WEIGHT;
             }
-            return opPieces <= 3 ? totalProximity * 3 : totalProximity;
+            return opPieces <= 3 ? total * 3 : total;
         }
 
         private int GetOpeningKillScore(string?[][] b, string me, string op, bool iAmAttacker)
         {
-            int bonus = 0;
-            int[] dr = { -1, 1, 0, 0 }, dc = { 0, 0, -1, 1 };
+            int bonus = 0; int[] dr = { -1, 1, 0, 0 }, dc = { 0, 0, -1, 1 };
             for (int i = 0; i < 4; i++)
             {
-                int adjR = 2 + dr[i], adjC = 2 + dc[i];
-                int farR = 2 + dr[i] * 2, farC = 2 + dc[i] * 2;
+                int adjR = 2 + dr[i], adjC = 2 + dc[i], farR = 2 + dr[i] * 2, farC = 2 + dc[i] * 2;
                 if (In(adjR, adjC) && In(farR, farC))
                 {
-                    if (b[farR][farC] == me && b[adjR][adjC] == op)
-                        bonus += iAmAttacker ? 5000 : 500;
-                    if (b[farR][farC] == op && b[adjR][adjC] == me)
-                        bonus -= iAmAttacker ? 1000 : 8000;
+                    if (b[farR][farC] == me && b[adjR][adjC] == op) bonus += iAmAttacker ? 5000 : 500;
+                    if (b[farR][farC] == op && b[adjR][adjC] == me) bonus -= iAmAttacker ? 1000 : 8000;
                 }
             }
             return bonus;
@@ -94,33 +90,31 @@ namespace SeegaGame.Services
             if (phase == GamePhase.PLACEMENT)
             {
                 if (m.To.R == 2 && m.To.C == 2) return -1000;
-                int score = 100 - (Math.Abs(m.To.R - 2) + Math.Abs(m.To.C - 2)) * 10;
+                int s = 100 - (Math.Abs(m.To.R - 2) + Math.Abs(m.To.C - 2)) * 10;
                 if (IsVulnerableToOpeningKill(board, m.To.R, m.To.C, player)) return -50000;
-                return score;
+                return s;
             }
             var ud = _gs.MakeMove(board, m, player, phase, moveIndex);
-            int s = ud.Captured.Count * 2000;
+            int cap = ud.Captured.Count * 2000;
             _gs.UnmakeMove(board, ud, player);
-            return s;
+            return cap;
         }
 
         private int GetFastMoveOrderingScore(string?[][] board, Move m, string player, string attackerName)
         {
-            int score = 0; string op = _gs.GetOpponent(player);
-            if (IsCaptureMove(board, m, player)) score += 15000;
-            if (m.From != null && IsSuicideMove(board, m, player, op)) score -= 25000;
-            score += (10 - (Math.Abs(m.To.R - 2) + Math.Abs(m.To.C - 2)));
-            return score;
+            int s = 0; string op = _gs.GetOpponent(player);
+            if (IsCaptureMove(board, m, player)) s += 15000;
+            if (m.From != null && IsSuicideMove(board, m, player, op)) s -= 25000;
+            return s + (10 - (Math.Abs(m.To.R - 2) + Math.Abs(m.To.C - 2)));
         }
 
         private bool IsSuicideMove(string?[][] board, Move m, string player, string op)
         {
             if (m.From == null) return false;
-            string? originFrom = board[m.From.R][m.From.C];
-            string? originTo = board[m.To.R][m.To.C];
+            string? oF = board[m.From.R][m.From.C], oT = board[m.To.R][m.To.C];
             board[m.From.R][m.From.C] = null; board[m.To.R][m.To.C] = player;
             bool risk = IsPieceAtRisk(board, m.To.R, m.To.C, player, op);
-            board[m.From.R][m.From.C] = originFrom; board[m.To.R][m.To.C] = originTo;
+            board[m.From.R][m.From.C] = oF; board[m.To.R][m.To.C] = oT;
             return risk;
         }
 
@@ -139,13 +133,13 @@ namespace SeegaGame.Services
             return false;
         }
 
-        private bool CanPlayerReach(string?[][] b, string player, int tr, int tc)
+        private bool CanPlayerReach(string?[][] b, string p, int tr, int tc)
         {
             int[] dr = { -1, 1, 0, 0 }, dc = { 0, 0, -1, 1 };
             for (int i = 0; i < 4; i++)
             {
                 int nr = tr + dr[i], nc = tc + dc[i];
-                if (In(nr, nc) && b[nr][nc] == player) return true;
+                if (In(nr, nc) && b[nr][nc] == p) return true;
             }
             return false;
         }
@@ -166,9 +160,8 @@ namespace SeegaGame.Services
         {
             if (Math.Abs(r - 2) + Math.Abs(c - 2) != 1) return false;
             string op = _gs.GetOpponent(me);
-            int oppR = 2 + (2 - r), oppC = 2 + (2 - c);
-            if (In(oppR, oppC) && b[oppR][oppC] == op) return true;
-            return false;
+            int oR = 2 + (2 - r), oC = 2 + (2 - c);
+            return In(oR, oC) && b[oR][oC] == op;
         }
     }
 }

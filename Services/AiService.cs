@@ -55,14 +55,16 @@ namespace SeegaGame.Services
             var ctx = GetContext(req.GameUUId);
             long h = InitialHash(req.Board, req.CurrentPlayer);
 
-            int currentGroup = (req.MoveIndex - 1) / 2;
-            string attackerName = (currentGroup % 2 == 1) ? req.CurrentPlayer : _gs.GetOpponent(req.CurrentPlayer);
+            // 【鋼鐵修正】基於預測表判定誰是 P2 (第 25 手攻擊者)
+            string attackerName;
+            if (req.MoveIndex <= 2) attackerName = _gs.GetOpponent(req.CurrentPlayer); // P1在動, P2是攻
+            else if (req.MoveIndex <= 4) attackerName = req.CurrentPlayer;             // P2在動, 自己是攻
+            else attackerName = (req.MoveIndex % 2 == 0) ? req.CurrentPlayer : _gs.GetOpponent(req.CurrentPlayer);
 
             if (req.Phase == GamePhase.STUCK_REMOVAL)
             {
-                return _gs.GetValidMoves(req.Board, req.CurrentPlayer, req.Phase, null, null)
-                    .OrderByDescending(m => EvaluateRemovalMove(req.Board, m, req.CurrentPlayer, req.LastMoveX, req.LastMoveO, attackerName))
-                    .FirstOrDefault();
+                var movesR = _gs.GetValidMoves(req.Board, req.CurrentPlayer, req.Phase, null, null);
+                return movesR.OrderByDescending(m => EvaluateRemovalMove(req.Board, m, req.CurrentPlayer, req.LastMoveX, req.LastMoveO, attackerName)).FirstOrDefault();
             }
 
             var moves = _gs.GetValidMoves(req.Board, req.CurrentPlayer, req.Phase, req.LastMoveX, req.LastMoveO);

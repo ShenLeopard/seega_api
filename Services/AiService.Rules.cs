@@ -12,8 +12,6 @@ namespace SeegaGame.Services
             return lastMove;
         }
 
-        // 核心修正：移除容易混淆的 InferFirstPlayer，邏輯已移至 GetBestMove 並固定。
-        // 其餘輔助規則保持原樣。
         private int CalculateVulnerability(string?[][] board, int r, int c, string opponent)
         {
             int v = 0; int[] dr = { 1, 0 }, dc = { 0, 1 };

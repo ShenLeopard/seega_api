@@ -71,8 +71,6 @@ namespace SeegaGame.Services
                 else
                     score = -AlphaBeta(ctx, board, state.nextHash, d - 1, -beta, -alpha, state.nextPlayer, nX, nO, state.nextPhase, idx + 1, attackerName);
 
-                if (ph == GamePhase.MOVEMENT && ud.Captured.Count == 0) score -= 10;
-
                 _gs.UnmakeMove(board, ud, curr);
                 if (score > bestS) bestS = score;
                 alpha = Math.Max(alpha, score);
@@ -95,9 +93,11 @@ namespace SeegaGame.Services
             {
                 var ud = _gs.MakeMove(board, m, curr, ph, idx);
                 var state = GetNextState(h, m, curr, ph, idx, ud);
-                int score = state.isSamePlayer
-                    ? Quiesce(ctx, board, state.nextHash, alpha, beta, curr, (curr == "X" ? m : lX), (curr == "O" ? m : lO), state.nextPhase, idx + 1, attackerName)
-                    : -Quiesce(ctx, board, state.nextHash, -beta, -alpha, state.nextPlayer, (curr == "X" ? m : lX), (curr == "O" ? m : lO), state.nextPhase, idx + 1, attackerName);
+                int score;
+                if (state.isSamePlayer)
+                    score = Quiesce(ctx, board, state.nextHash, alpha, beta, curr, (curr == "X" ? m : lX), (curr == "O" ? m : lO), state.nextPhase, idx + 1, attackerName);
+                else
+                    score = -Quiesce(ctx, board, state.nextHash, -beta, -alpha, state.nextPlayer, (curr == "X" ? m : lX), (curr == "O" ? m : lO), state.nextPhase, idx + 1, attackerName);
                 _gs.UnmakeMove(board, ud, curr);
                 if (score >= beta) return beta;
                 if (score > alpha) alpha = score;
@@ -128,12 +128,15 @@ namespace SeegaGame.Services
                 if (req.MoveIndex == 24) return Math.Max(req.Difficulty, 6);
                 return (req.MoveIndex >= 18) ? Math.Min(7, (24 - req.MoveIndex) + 2) : 3;
             }
-            int my = 0, op = 0;
-            foreach (var r in req.Board) foreach (var c in r)
-                {
-                    if (c == req.CurrentPlayer) my++; else if (c != null) op++;
-                }
-            if (my - op >= 5 && op <= 4) return 4;
+            if (req.Phase == GamePhase.MOVEMENT)
+            {
+                int my = 0, op = 0;
+                foreach (var r in req.Board) foreach (var c in r)
+                    {
+                        if (c == req.CurrentPlayer) my++; else if (c != null) op++;
+                    }
+                if (my - op >= 5 && op <= 4) return 4;
+            }
             return req.Difficulty;
         }
     }

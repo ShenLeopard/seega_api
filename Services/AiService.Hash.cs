@@ -30,6 +30,7 @@ namespace SeegaGame.Services
         private (long nextHash, string nextPlayer, GamePhase nextPhase, bool isSamePlayer) GetNextState(long h, Move m, string curr, GamePhase ph, int idx, UndoData ud)
         {
             long nh = UpdatePieceHash(h, m, curr, ud.Captured, ud.ClearedCenterPiece, ph);
+            // Combo 判斷：Index 1, 3 續動，Index 24 完接續移動
             bool isCombo = (ph == GamePhase.PLACEMENT && (idx == 1 || idx == 3 || idx == 24));
             if (isCombo)
             {
